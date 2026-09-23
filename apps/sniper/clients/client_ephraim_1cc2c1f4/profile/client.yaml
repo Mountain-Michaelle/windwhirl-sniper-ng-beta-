@@ -1,0 +1,8 @@
+client_id: client_ephraim_1cc2c1f4
+name_key: ephraim
+display_name: ephraim
+created_at: "2026-09-15T20:27:00Z"
+enabled: true
+credential_reference: env:EPHRAIM_1CC2C1F4
+# Configure crm_account_id before uploading.
+crm_account_id: client_ephraim_1cc2c1f4

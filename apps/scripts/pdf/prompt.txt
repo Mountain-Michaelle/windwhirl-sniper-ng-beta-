@@ -1,0 +1,118 @@
+# Header Row Caching — Methodology & Goals
+
+## The problem this solves
+
+Six different functions in the Order Normalizer script each independently
+ask the sheet "what's in row 1 (the header row)?" — and each one does it as
+its **own separate round-trip** to Google's servers, even when the answer
+is identical across all six because nothing changed row 1 in between.
+
+| # | Function | Why it reads row 1 |
+|---|---|---|
+| 1 | `findOrCreateOptionalColumn_` | look up / create a bonus column |
+| 2 | `findOrCreateOptionalColumnLookup_` | shared lookup used by every bonus-column wrapper |
+| 3 | `resolveColumns_` | map all 22 canonical columns to their current position |
+| 4 | `findOrCreateReportColumn_` | look up / create the Report column |
+| 5 | `snapshotHeaderRow_` | back up row 1 for the header-lock feature |
+| 6 | `verifyColumnLayout` | manual "show me everything" check |
+
+`onOpen()` alone triggers #1–#3 in sequence — #2 gets called roughly once
+per bonus column (currently ~10 of them) — meaning a single file-open was
+making **~12 sequential reads of the exact same row**. On a mobile network,
+where each round-trip carries more latency than on wifi, that's real, felt
+delay before anything the user actually sees (like the recent-orders
+scroll) can even attempt to fire.
+
+## Goals, in priority order
+
+1. **No new errors, ever.** A caching bug that serves stale data is worse
+   than the slowness it fixes — it can make the script write to the *wrong
+   column*. Correctness is not negotiable in exchange for speed.
+2. **Fewer round-trips**, especially in `onOpen()`, since that's the path
+   racing against the mobile app's own independent render.
+3. **Zero behavior change.** Every function must return exactly the same
+   answer as before, every time — caching is purely an internal speed
+   optimization, invisible from the outside.
+4. **Self-explanatory failure mode.** If the cache is ever wrong for some
+   unforeseen reason, the *existing* error-handling in each caller (column
+   resolution errors, try/catch blocks already in place) should be what
+   surfaces it — not a new, confusing failure mode.
+
+## The design: two independent safety layers
+
+A single "trust me, I'll remember to invalidate everywhere" cache is
+fragile — exactly the kind of thing that produces a subtle bug three
+features later when someone (including me) forgets one call site. So the
+design uses two layers that don't depend on each other:
+
+### Layer 1 — Structural (automatic, cannot be forgotten)
+
+Every cache read also checks `sheet.getLastColumn()` — a cheap,
+metadata-only call, not a values read — against what's cached. Every bonus
+column this file creates is **appended**, never inserted (a rule already
+enforced everywhere else in this codebase). Appending always changes
+`getLastColumn()`, so this check alone auto-invalidates the cache for that
+entire class of write, with no reliance on any function remembering to call
+anything.
+
+### Layer 2 — Explicit (belt-and-suspenders)
+
+The rarer case: a header's **text** changes without the column count
+changing at all — a rename, a snapshot restore, Initialize Sheet rewriting
+the canonical row, the legacy S/N↔Filtered# migration tool. Layer 1 can't
+see these (`getLastColumn()` is unchanged), so each of these exact sites
+calls `invalidateHeaderRowCache_()` directly, immediately after writing.
+This is intentionally redundant with Layer 1 for the append cases too —
+defense in depth costs nothing here.
+
+### Scope
+
+The cache (`_headerRowCache`) is a single variable living for exactly one
+script execution. Apps Script always starts fresh per trigger — every
+`onOpen`, every `onEdit`, every menu click is a brand-new execution — so
+nothing can ever leak between separate opens, edits, or runs. This is what
+makes the cache safe to keep dead simple: no expiry timers, no cross-session
+invalidation logic needed at all.
+
+## Every write site that must invalidate (Layer 2)
+
+| Site | Function | Status |
+|---|---|---|
+| Append a new bonus column | `findOrCreateOptionalColumn_` | Not yet done  |
+| Append the Report column | `findOrCreateReportColumn_` | Not yet done  |
+| Rename legacy "Auto Carried Over?" → "Schedule Source" | `findOrCreateScheduleSourceColumn_` | Not yet done  |
+| Clear a neutralized legacy header | `neutralizeLegacyAutoCarriedOverColumn_` | Not yet done  |
+| Restore header row from snapshot (lock feature) | `restoreHeaderSnapshot_` | Not yet done  |
+| Write the full canonical header row | `initializeSheet_impl` | Not yet done  |
+| Rename S/N ↔ Filtered # headers (legacy one-time tool) | `swapSnAndFilteredColumns_migration` | ⏳ **not yet done** — two `setValue` calls, needs one `invalidateHeaderRowCache_()` call after both |
+
+## Every read site routed through the cache (Layer benefit)
+
+| Site | Status |
+|---|---|
+| `findOrCreateOptionalColumn_` | Not yet done  |
+| `findOrCreateOptionalColumnLookup_` | Not yet done  |
+| `resolveColumns_` | Not yet done  |
+| `findOrCreateReportColumn_` | Not yet done  |
+| `snapshotHeaderRow_` | ⏳ not yet done (still reads directly) |
+| `verifyColumnLayout` | ⏳ not yet done (still reads directly — lowest priority, it's a manual, infrequent action) |
+
+## Why this specific design was chosen over the simpler alternative
+
+The simpler version — cache with only explicit invalidation, no
+`getLastColumn()` check — was rejected. It would have required correctly
+instrumenting all 7 write sites with no safety net; missing even one means
+a silent stale-read bug with no error message anywhere, surfacing only as
+mysteriously-wrong data days later. Layer 1 turns the most common write
+pattern (appending a column — 2 of the 7 sites, and the ones that fire most
+often) into something that **can't** be gotten wrong, structurally,
+regardless of whether Layer 2 is remembered correctly everywhere.
+
+## Net effect once complete
+
+`onOpen()` drops from ~12 sequential header-row reads to effectively 1 real
+read plus ~11 cheap `getLastColumn()` metadata checks (themselves far
+lighter than a values read) — with the scroll-to-recent-orders attempt now
+also reordered to run first, before any of that bonus-column housekeeping,
+so it gets the earliest possible shot at beating the mobile app's own
+independent render.

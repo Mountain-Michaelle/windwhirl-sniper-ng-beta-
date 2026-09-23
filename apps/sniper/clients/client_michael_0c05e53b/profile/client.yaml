@@ -1,0 +1,8 @@
+client_id: client_michael_0c05e53b
+name_key: michael
+display_name: michael
+created_at: "2026-09-13T20:36:56Z"
+enabled: true
+credential_reference: env:MICHAEL_0C05E53B
+# Configure crm_account_id before uploading.
+crm_account_id: client_michael_0c05e53b

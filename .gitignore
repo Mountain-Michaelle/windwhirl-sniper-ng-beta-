@@ -1,0 +1,100 @@
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Python environments, bytecode, and test caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Browser profiles, authentication state, and automation sessions
+.sessions/
+**/.sessions/
+playwright/.cache/
+**/user-data-dir/
+**/browser-data/
+
+# Generated runtime output
+logs/
+**/logs/
+reports/
+**/reports/
+screenshots/
+**/screenshots/
+recordings/
+**/recordings/
+**/diagnostics/
+**/closure_diagnostics/
+**/runs/
+test_out/
+**/test_out/
+.fingerprints/
+**/.fingerprints/
+
+# Local databases and transient database files
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+
+# Private or disposable input/output files
+*.xlsx
+*.xls
+*.csv
+*.pdf
+*.zip
+*.old
+*.bak
+*.tmp
+*.temp
+*.cache
+*.crdownload
+*.part
+*~
+
+# Managed client runtime workspaces and generated job state
+**/clients/_inbox/
+**/clients/_rejected/
+**/clients/_needs_disambiguation/
+**/clients/*/auth/
+**/clients/*/browser/
+**/clients/*/catalog/
+**/clients/*/state/
+**/clients/*/jobs/
+**/customers/data/
+**/customers/progress/
+**/customers/manual_check/
+
+# Log and diagnostic files
+*.log
+*.pma
+*.dmp
+*.dump
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+*.whl

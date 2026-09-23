@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head><title>Mock Add Multi Order (realistic markup)</title></head>
+<body>
+  <form id="orderForm">
+    <!-- Product row: select is the FIRST cell, no adjacent label -- label
+         only exists as a column header and as the select's own first option,
+         exactly like the real #selpro / #pricevar structure. -->
+    <table>
+      <thead>
+        <tr><th>Product</th><th>Qty/Price</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <select id="selpro">
+              <option value="">Select Product</option>
+              <option value="1">Sadoer Collagen Serum</option>
+            </select>
+          </td>
+          <td>
+            <select id="pricevar">
+              <option value="">Select</option>
+              <option value="a">30ml &amp; 100g NGN29500</option>
+            </select>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- Customer row: completely bare inputs, no id/name/placeholder/label at all,
+         exactly like the real recording ("input.form-control" only). -->
+    <table>
+      <tbody>
+        <tr>
+          <td>Customers Name</td>
+          <td><input class="form-control" /></td>
+        </tr>
+        <tr>
+          <td>Phone Number</td>
+          <td><input class="form-control" /></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <select id="state">
+      <option value="">Select</option>
+      <option value="anambra">Anambra</option>
+    </select>
+
+    <!-- payment select: bare, only a generic class, like the real one -->
+    <select class="form-control">
+      <option value="">Select</option>
+      <option value="cash">Cash</option>
+    </select>
+
+    <button id="submit" type="button">Save</button>
+  </form>
+  <script>
+    document.getElementById('submit').addEventListener('click', () => {
+      const div = document.createElement('div');
+      div.className = 'swal2-success';
+      div.textContent = 'Order Saved Successfully';
+      document.body.appendChild(div);
+    });
+  </script>
+</body>
+</html>

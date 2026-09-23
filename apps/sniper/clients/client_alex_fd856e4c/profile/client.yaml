@@ -1,0 +1,8 @@
+client_id: client_alex_fd856e4c
+name_key: alex
+display_name: alex
+created_at: "2026-09-13T20:36:57Z"
+enabled: true
+credential_reference: env:ALEX_FD856E4C
+# Configure crm_account_id before uploading.
+crm_account_id: client_alex_fd856e4c

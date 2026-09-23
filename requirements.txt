@@ -1,0 +1,26 @@
+playwright==1.45.0       # Controls Chrome browser to automate WhatsApp Web
+# pandas==2.2.2            # Reads and processes the Excel customer file
+# openpyxl==3.1.4          # Pandas engine for reading .xlsx files
+# sqlalchemy==2.0.31       # ORM for SQLite database (customers + send log)
+# apscheduler==3.10.4      # Schedules 6 sending sessions per day
+# jinja2==3.1.4            # Renders personalized message templates
+# pillow==10.4.0           # Image processing for product images (future)
+# pyyaml==6.0.1            # Reads YAML config files (future migration)
+# python-dotenv==1.0.1     # Loads .env files for secrets management
+# aiofiles==23.2.1         # Async file I/O used by Playwright internals
+
+# ── ACTUAL FILE CONTENT (remove the # prefix when saving) ─────
+# Save the lines below exactly as shown — no leading #
+
+"""
+playwright==1.45.0
+pandas==2.2.2
+openpyxl==3.1.4
+sqlalchemy==2.0.31
+apscheduler==3.10.4
+jinja2==3.1.4
+pillow==10.4.0
+pyyaml==6.0.1
+python-dotenv==1.0.1
+aiofiles==23.2.1
+"""

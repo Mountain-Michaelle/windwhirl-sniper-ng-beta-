@@ -1,0 +1,23 @@
+{
+  "name_keys": {
+    "alex": [
+      "client_alex_fd856e4c"
+    ],
+    "chisom": [
+      "client_chisom_7254e7b4"
+    ],
+    "ephraim": [
+      "client_ephraim_1cc2c1f4"
+    ],
+    "jane": [
+      "client_jane_f6bf8065"
+    ],
+    "michael": [
+      "client_michael_0c05e53b"
+    ],
+    "valentine": [
+      "client_valentine_8232c8bd"
+    ]
+  },
+  "schema_version": 1
+}

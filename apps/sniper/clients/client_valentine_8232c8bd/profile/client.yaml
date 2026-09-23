@@ -1,0 +1,8 @@
+client_id: client_valentine_8232c8bd
+name_key: valentine
+display_name: valentine
+created_at: "2026-09-15T20:26:59Z"
+enabled: true
+credential_reference: env:VALENTINE_8232C8BD
+# Configure crm_account_id before uploading.
+crm_account_id: client_valentine_8232c8bd
