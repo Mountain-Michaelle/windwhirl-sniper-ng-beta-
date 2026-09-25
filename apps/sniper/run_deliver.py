@@ -406,6 +406,25 @@ from apps.sniper.product_deliver.runner import (  # noqa: E402,F401
     run,
 )
 
+from apps.sniper.product_deliver.duplicates import (  # noqa: E402,F401
+    DuplicateLedger,
+    DUPLICATE_COLUMNS,
+    customer_fingerprint,
+    customer_key,
+    export_duplicate,
+    groups_from_rows,
+    order_fingerprint,
+    order_key,
+)
+from apps.sniper.product_deliver.scan import (  # noqa: E402,F401
+    collect_page_rows,
+    collect_tab_pages,
+    enrich_rows,
+    read_table_bulk,
+    scan_duplicates,
+    scan_once,
+    scan_tab_pages,
+)
 from apps.sniper.client_workspace import (  # noqa: E402,F401
     JobLock,
     WorkspaceManager,

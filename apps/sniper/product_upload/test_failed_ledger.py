@@ -242,8 +242,7 @@ def test_call_arity_matches_signatures():
         name: inspect.signature(getattr(ru, name))
         for name in ("_attempt_order", "_drain_retry_queue",
                      "_drain_failed_ledger", "_run_session",
-                     "_run_upload", "_run_sharded", "main",
-                     "_prewarm_todo_state_cache")
+                     "_run_upload", "_run_sharded", "main")
     }
     source = Path(ru.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -472,77 +471,61 @@ def test_planning_price_fallback_fills_hole_but_never_overrides_hit():
 
 # __TEST_PART_5__
 
-# ------------- Oct 2026: state search + Lagos default --------------------
-def test_planning_blank_address_defaults_to_lagos_no_search(monkeypatch):
-    """Empty address -> 'Lagos' for both field and state, and the web search
-    must never fire (nothing to search on, and speed)."""
+# ------------- Oct 2026: local-only state inference (no web, no fallback) --
+def test_planning_blank_address_raises_missing_address_error():
+    """Empty address -> MissingAddressError (a PlanningError subclass): the
+    caller flags the row for a human on the first sighting. No state and no
+    fallback are guessed here."""
     from apps.sniper.product_upload import planning
-    import apps.sniper.product_upload.state_engine as se
-    called = []
-    monkeypatch.setattr(se, "_web_lookup_state",
-                        lambda addr: called.append(addr) or "Edo")
-    catalog = ["Sadoer Collagen Combo Set"]
+    with pytest.raises(planning.MissingAddressError):
+        planning.build_execution_plan(
+            {"product": "Sadoer Collagen Combo Set", "price": "29500",
+             "address": "   "}, ["Sadoer Collagen Combo Set"])
+
+
+def test_planning_unresolvable_address_skips_state():
+    """An address the local tables cannot resolve -> plan.state is None:
+    the caller skips the state field entirely and saves. No network, no
+    Lagos fallback."""
+    from apps.sniper.product_upload import planning
     plan = planning.build_execution_plan(
         {"product": "Sadoer Collagen Combo Set", "price": "29500",
-         "address": "   "}, catalog)
-    assert plan.order["address"] == "Lagos"
-    assert plan.state == "Lagos" and plan.used_state_fallback is True
-    assert called == []
+         "address": "Okapanam unmappable zone 99xyz"},
+        ["Sadoer Collagen Combo Set"])
+    assert plan.state is None
+    assert plan.used_state_fallback is False
 
 
-def test_state_search_first_known_state_wins_and_caches(monkeypatch):
-    """Mocked search mentioning Edo first resolves Edo; the second identical
-    address costs zero extra lookups (per-run cache)."""
+def test_planning_local_hit_selects_state(monkeypatch):
+    """A locally resolvable address still resolves to its state, and the
+    memo never touches the network (no such call site exists any more)."""
+    from apps.sniper.product_upload import planning
     import apps.sniper.product_upload.state_engine as se
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
+    se.clear_memo()
+    plan = planning.build_execution_plan(
+        {"product": "Sadoer Collagen Combo Set", "price": "29500",
+         "address": "14 Allen Avenue, Ikeja, Lagos"},
+        ["Sadoer Collagen Combo Set"])
+    assert plan.state == "Lagos"
+
+
+def test_memo_repeats_cost_one_inference(monkeypatch):
+    """The in-process memo: the same address (different spacing) resolves
+    once; a counting infer_state proves the second call is served from
+    the memo."""
+    import apps.sniper.product_upload.state_engine as se
+    se.clear_memo()
     calls = []
-    monkeypatch.setattr(
-        se, "_web_lookup_state",
-        lambda addr: calls.append(addr) or "beautiful Edo State governor")
-    assert se.infer_state_with_search("Somewhere Unmapped 123") == "Edo"
-    assert se.infer_state_with_search("Somewhere Unmapped 123") == "Edo"
+    real = se.infer_state
+
+    def _counting(addr):
+        calls.append(addr)
+        return real(addr)
+    monkeypatch.setattr(se, "infer_state", _counting)
+    assert se.infer_state_memoized("  14 Allen   Ikeja  ") == "Lagos"
+    assert se.infer_state_memoized("14 Allen Ikeja") == "Lagos"
     assert len(calls) == 1
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
-
-
-def test_state_search_double_miss_and_errors_fall_back(monkeypatch):
-    """Two misses / raised exceptions -> None, so planning lands on Lagos."""
-    import apps.sniper.product_upload.state_engine as se
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
-    monkeypatch.setattr(se, "_web_lookup_state", lambda addr: None)
-    assert se.infer_state_with_search("Nowhere At All") is None
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
-
-    def _boom(addr):
-        raise RuntimeError("no network")
-    monkeypatch.setattr(se, "_web_lookup_state", _boom)
-    assert se.infer_state_with_search("Nowhere At All") is None
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
-
-
-def test_state_from_search_text_needs_word_boundary():
-    """'IBOM plaza' alone must not resolve Akwa Ibom -- the match is exact on
-    word boundaries over the normalized text."""
-    from apps.sniper.product_upload.state_engine import _state_from_search_text
-    assert _state_from_search_text("lovely IBOM plaza, great food") is None
-    assert _state_from_search_text("delivery to Uyo, Akwa Ibom State") == "Akwa Ibom"
-    assert _state_from_search_text("which state in Nigeria is 12 Allen, Ikeja") is None
-
-
-def test_local_state_hit_never_touches_network(monkeypatch):
-    """A locally resolvable address must not trigger any HTTP call."""
-    import apps.sniper.product_upload.state_engine as se
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
-    monkeypatch.setattr(se, "_web_lookup_state",
-                        lambda addr: (_ for _ in ()).throw(
-                            AssertionError("network must not fire")))
-    assert se.infer_state_with_search("14 Allen Avenue, Ikeja, Lagos") == "Lagos"
+    se.clear_memo()
 
 # __TEST_PART_6__
 
@@ -604,7 +587,7 @@ def test_todo_filter_skips_done_rows_before_planning(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
         ru, "build_execution_plan",
-        lambda order, catalog, state_fallback=None: calls.append(order) or "PLAN")
+        lambda order, catalog: calls.append(order) or "PLAN")
     plans = {}
     for row_number, order in todo:
         plans[row_number] = ru.build_execution_plan(order, ["catalog"])
@@ -786,31 +769,24 @@ def test_close_open_combo_last_selection_fallback_before_dead_space():
 # - Oct 2026: NaN-address modal-close fix + temporal state cache + fast search
 def _clear_state_caches():
     import apps.sniper.product_upload.state_engine as se
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
+    se.clear_memo()
     return se
 
 
-def test_nan_address_plan_defaults_to_lagos_no_search(monkeypatch):
-    """pandas NaN address -> plan holds 'Lagos' for field+state, so the
-    browser fills a real, verifiable address instead of an empty box that
-    could never verify (3 wasted attempts -> transient failure -> the
-    cleanup that closes the modal -> identical retry)."""
+def test_nan_address_plan_raises_missing_address_error():
+    """pandas NaN address -> MissingAddressError (the caller flags it for a
+    human on the first sighting and injects its own 'Lagos' default on the
+    second); planning never guesses a state from nothing."""
     from apps.sniper.product_upload import planning
-    se = _clear_state_caches()
-    called = []
-    monkeypatch.setattr(se, "_web_lookup_state",
-                        lambda addr: called.append(addr) or "Edo")
-    plan = planning.build_execution_plan(
-        {"product": "Sadoer Collagen Combo Set", "price": "29500",
-         "address": float("nan")},
-        ["Sadoer Collagen Combo Set"])
-    assert plan.order["address"] == "Lagos"
-    assert plan.state == "Lagos" and plan.used_state_fallback is True
-    assert called == []
+    _clear_state_caches()
+    with pytest.raises(planning.MissingAddressError):
+        planning.build_execution_plan(
+            {"product": "Sadoer Collagen Combo Set", "price": "29500",
+             "address": float("nan")},
+            ["Sadoer Collagen Combo Set"])
 
 
-def test_fill_order_for_plan_merges_planned_lagos_address():
+def test_fill_order_for_plan_merges_planned_address():
     """The fill dict takes the plan's effective address; every other field
     and the raw order stay untouched; no plan -> same object back."""
     import apps.sniper.product_upload.add_products as ap
@@ -818,9 +794,11 @@ def test_fill_order_for_plan_merges_planned_lagos_address():
     _clear_state_caches()
     raw = {"customer_name": "N", "phone_number": "0801",
            "address": float("nan"), "product": "x"}
+    # Second-sighting behaviour (run_upload.py injects 'Lagos' before
+    # planning), so the plan holds a real, verifiable fill address.
     plan = planning.build_execution_plan(
         {"product": "Sadoer Collagen Combo Set", "price": "29500",
-         "address": float("nan")},
+         "address": "Lagos"},
         ["Sadoer Collagen Combo Set"])
     filled = ap._fill_order_for_plan(raw, plan)
     assert filled["address"] == "Lagos"
@@ -877,117 +855,114 @@ def test_fill_customer_info_nan_address_fills_lagos():
     assert store[sel.ADDRESS_INPUT_SELECTOR] == "Lagos"
 
 
-def test_state_disk_cache_roundtrip_costs_zero_lookups(tmp_path, monkeypatch):
-    """Save -> wipe memory -> load: the next run resolves from the job's
-    state_cache.json with ZERO network calls, and provenance reports
-    ', disk'. A missing file loads as 0, never raises."""
-    se = _clear_state_caches()
-    monkeypatch.setattr(se, "_web_lookup_state",
-                        lambda addr: ("Edo" if "unmapped" in addr.lower()
-                                      else None))
-    assert se.infer_state_with_search("Somewhere Unmapped 123") == "Edo"
-    assert se.infer_state_with_search("Nowhere At All XYZ") is None
-    assert se.save_state_cache(tmp_path) == 2
-    assert (tmp_path / "state_cache.json").exists()
-
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
-    assert se.load_state_cache(tmp_path) == 2
-
-    def _no_network(addr):
-        raise AssertionError("network must not fire on a disk hit")
-    monkeypatch.setattr(se, "_web_lookup_state", _no_network)
-    assert se.infer_state_with_search("Somewhere Unmapped 123") == "Edo"
-    assert se.infer_state_with_search("Nowhere At All XYZ") is None
-    assert se.cache_lookup_source("Somewhere Unmapped 123") == "web, disk"
-    assert se.cache_lookup_source("Nowhere At All XYZ") == "web-miss, disk"
-    assert se.load_state_cache(tmp_path / "does-not-exist") == 0
+# ---------------- Oct 2026: missing-address counter (first flag, 2nd Lagos) --
+def _ma_order(**over):
+    order = {"customer_name": "Ada Obi", "phone_number": "08011112222",
+             "product": "Sadoer Collagen Combo Set", "price": "29500",
+             "address": "", "filtered_sn": "7", "excel_row": 13}
+    order.update(over)
+    return order
 
 
-def test_clean_miss_costs_one_lookup_transport_error_two(monkeypatch):
-    """A clean 'no known state mentioned' is final (1 lookup, no pointless
-    immediate retry); only a transport error earns attempt 2."""
-    se = _clear_state_caches()
-    calls = []
-    monkeypatch.setattr(se, "_web_lookup_state",
-                        lambda addr: calls.append(addr) or None)
-    assert se.infer_state_with_search("Clean Miss Address XYZ") is None
-    assert len(calls) == 1
-
-    se._SEARCH_CACHE.clear()
-    se._SEARCH_CACHE_META.clear()
-    flaky = []
-
-    def _flaky(addr):
-        flaky.append(addr)
-        if len(flaky) == 1:
-            se._lookup_error_local.had_error = True
-            return None
-        se._lookup_error_local.had_error = False
-        return "Edo"
-    monkeypatch.setattr(se, "_web_lookup_state", _flaky)
-    assert se.infer_state_with_search("Flaky Address XYZ") == "Edo"
-    assert len(flaky) == 2
-
-
-def test_prewarm_dedups_and_skips_local(monkeypatch):
-    """Parallel pre-warm: identical addresses cost one lookup total, and a
-    locally resolvable address never touches the network."""
-    se = _clear_state_caches()
-    calls = []
-
-    def _count(addr):
-        calls.append(addr)
-        return "Ogun" if "sango" in addr.lower() else None
-    monkeypatch.setattr(se, "_web_lookup_state", _count)
-    out = se.prewarm_state_cache(
-        ["Sango ota garage", "Sango ota garage", "Okapanam xyz",
-         "14 Allen Avenue, Ikeja, Lagos"],
-        max_workers=4)
-    assert out["Sango ota garage"] == "Ogun"
-    assert out["Okapanam xyz"] is None
-    assert out["14 Allen Avenue, Ikeja, Lagos"] == "Lagos"
-    assert sorted(calls) == ["Okapanam xyz", "Sango ota garage"]
-
-
-def test_prewarm_todo_helper_logs_each_extraction(capsys, monkeypatch):
-    """The session helper logs address -> state (+source) per row plus a
-    one-line run summary, and returns the per-row summary dict."""
+def test_missing_address_counter_flags_then_falls_back_and_resets(tmp_path,
+                                                                  monkeypatch,
+                                                                  capsys):
+    """Sighting 1 -> True (flagged, NOT uploaded) + HUMAN ACTION block naming
+    the Filtered # and customer name; sighting 2 -> False (proceed) and the
+    stored count RESETS, so the cycle can repeat."""
     import apps.sniper.run_upload as ru
-    monkeypatch.setattr(
-        ru, "prewarm_state_cache",
-        lambda addrs, max_workers=8: {
-            a: ("Ogun" if "sango" in a.lower() else None) for a in addrs})
-    monkeypatch.setattr(
-        ru, "cache_lookup_source",
-        lambda a: ("local" if "ikeja" in a.lower()
-                   else ("web" if "sango" in a.lower() else "web-miss")))
-    todo = [(1, {"address": "Sango ota garage"}),
-            (2, {"address": "14 Allen, Ikeja"}),
-            (3, {"address": "Okapanam xyz"})]
-    summary = ru._prewarm_todo_state_cache(todo)
+    monkeypatch.setattr(ru, "PROGRESS_DIR", tmp_path)
+    counts: dict[str, int] = {}
+
+    first = ru._handle_missing_address(_ma_order(), 3, counts)
+    assert first is True
     out = capsys.readouterr().out
-    assert "[state] row 1" in out and "Ogun" in out
-    assert "[state] row 3" in out and "Lagos(fallback)" in out
-    assert "address(es):" in out
-    assert set(summary) == {1, 2, 3}
-    assert ru._prewarm_todo_state_cache([]) == {}
-
-
-def test_save_merges_with_existing_disk_entries(tmp_path):
-    """Two --workers shard children saving concurrently only ever ADD keys
-    (last-write-wins per key), never wipe each other's resolutions."""
+    assert "HUMAN ACTION NEEDED" in out
+    assert "Filtered # = 7" in out and "Ada Obi" in out
+    assert "NOT uploaded" in out
+    assert set(counts.values()) == {1}
+    # persisted immediately
     import json
-    se = _clear_state_caches()
-    disk = tmp_path / "state_cache.json"
-    disk.write_text(json.dumps({
-        "old address": {"state": "Ogun", "source": "web",
-                        "resolved_at": "t", "address": "old address"}}),
-        encoding="utf-8")
-    se._remember_web_result("new address", "new address", "Edo")
-    assert se.save_state_cache(tmp_path) == 2
-    data = json.loads(disk.read_text(encoding="utf-8"))
-    assert data["old address"]["state"] == "Ogun"
-    assert data["new address"]["state"] == "Edo"
+    on_disk = json.loads((tmp_path / "missing_address_counts.json")
+                         .read_text(encoding="utf-8"))
+    assert set(on_disk.values()) == {1}
+
+    second = ru._handle_missing_address(_ma_order(), 3, counts)
+    assert second is False
+    out = capsys.readouterr().out
+    assert "proceeding automatically with the 'Lagos' address default" in out
+    assert counts == {}  # reset
+    on_disk = json.loads((tmp_path / "missing_address_counts.json")
+                         .read_text(encoding="utf-8"))
+    assert on_disk == {}
+
+
+def test_missing_address_save_merges_concurrent_writers(tmp_path, monkeypatch):
+    """A shard sibling's keys on disk are never wiped: save merges on
+    write (last-write-wins per key only)."""
+    import json
+    import apps.sniper.run_upload as ru
+    monkeypatch.setattr(ru, "PROGRESS_DIR", tmp_path)
+    (tmp_path / "missing_address_counts.json").write_text(
+        json.dumps({"sibling-key": 1}), encoding="utf-8")
+    ru._save_missing_address_counts({"mine": 1})
+    data = json.loads((tmp_path / "missing_address_counts.json")
+                      .read_text(encoding="utf-8"))
+    assert data == {"sibling-key": 1, "mine": 1}
+
+
+def test_load_missing_address_counts_tolerates_corrupt(tmp_path, monkeypatch):
+    """A corrupt/missing counts file loads as {} -- counting restarts
+    instead of failing the run."""
+    import apps.sniper.run_upload as ru
+    monkeypatch.setattr(ru, "PROGRESS_DIR", tmp_path)
+    assert ru._load_missing_address_counts() == {}
+    (tmp_path / "missing_address_counts.json").write_text(
+        "{not json", encoding="utf-8")
+    assert ru._load_missing_address_counts() == {}
+
+
+def test_load_orders_carries_filtered_sn_and_excel_row(tmp_path):
+    """load_orders stamps every order with the human-facing cell identifiers
+    (Filtered # value + real Excel row) used by the missing-address flag."""
+    import pandas as pd
+    import apps.sniper.run_upload as ru
+    src = tmp_path / "orders.xlsx"
+    naira = chr(0x20A6)  # the real 'Price (₦)' header, encoding-proof
+    pd.DataFrame({
+        "Filtered #": [1, 2],
+        "Customer Name": ["Ada", "Bola"],
+        "Phone Number": ["0801", "0802"],
+        "WhatsApp Number": ["", ""],
+        "Address": ["Ikeja Lagos", ""],
+        "Product": ["Sadoer Collagen Combo Set", "Sadoer Collagen Combo Set"],
+        f"Price ({naira})": ["29500", "29500"],
+    }).to_excel(src, index=False)
+    orders = ru.load_orders(str(src))
+    assert orders[0]["filtered_sn"] == "1" and orders[0]["excel_row"] == 2
+    assert orders[1]["excel_row"] == 3
+
+
+def test_load_orders_still_skips_fully_blank_rows(tmp_path):
+    """The Filtered #/excel-row stamping must never make an all-blank row
+    look non-blank (it is stamped only after the blank/required checks)."""
+    import pandas as pd
+    import apps.sniper.run_upload as ru
+    naira = chr(0x20A6)
+    src = tmp_path / "orders.xlsx"
+    pd.DataFrame({
+        "Filtered #": [1, 2, 3],
+        "Customer Name": ["Ada", "", ""],
+        "Phone Number": ["0801", "", ""],
+        "WhatsApp Number": ["", "", ""],
+        "Address": ["Ikeja Lagos", "", ""],
+        "Product": ["Sadoer Collagen Combo Set", "", ""],
+        f"Price ({naira})": ["29500", "", ""],
+    }).to_excel(src, index=False)
+    orders = ru.load_orders(str(src))
+    assert [o["customer_name"] for o in orders] == ["Ada"]
+
+
+
 
 

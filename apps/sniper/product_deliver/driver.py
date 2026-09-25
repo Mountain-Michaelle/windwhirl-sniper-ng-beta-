@@ -331,7 +331,7 @@ class DeliverDriver:
 
     # -- generic persistent combobox select --------------------------------
     def _select_combobox(self, trigger, option_selector: str, pick_fn,
-                         timeout_ms: int = 6000, max_attempts: int = 3,
+                         timeout_ms: int = 6000, max_attempts: int = 5,
                          label: str = "option", step: str = "filter"):
         """A single open->click on a Radix combobox / listbox option can
         close the popup without the trigger ever actually updating -- the
@@ -437,7 +437,8 @@ class DeliverDriver:
             return None
 
         self._select_combobox(trigger, 'div[role="option"]', _pick,
-                              label=f"Period '{period}'", step="filter")
+                              label=f"Period '{period}'", step="filter",
+                              max_attempts=5)
 
     # -- User (cmdk popover: doc §2.1(b) + cmdk spec) -----------------------
     @staticmethod
@@ -795,6 +796,12 @@ class DeliverDriver:
                 popup = self._popup_for_trigger()
                 option, seen = self._find_option(popup, chip)
                 if option is None:
+                    # The popup's own search narrows the list; a stored chip
+                    # that is missing (or moved) must NOT research forever.
+                    # One log line with what the popup actually shows, close
+                    # it, and return False so the run continues with the
+                    # filters that did apply.
+                    self._close_popups()
                     self._say("[deliver:filters] option '" + chip
                               + "' (also tried "
                               + repr(self._chip_variants(chip)[1:])
@@ -803,9 +810,7 @@ class DeliverDriver:
                               + "); popup shows: " + repr(seen)
                               + " -- set `filterBy` in the config to one of"
                               " these names")
-                    self._dump_filter_debug("option_" + chip)
-                    raise DeliverError("chip", "option '" + chip
-                                       + "' not in popup")
+                    return False
                 if not self._option_selected(option):
                     _center(option)
                     option.click(timeout=6000)

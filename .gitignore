@@ -80,9 +80,33 @@ test_out/
 
 # Log and diagnostic files
 *.log
+*.err
 *.pma
 *.dmp
 *.dump
+
+# Browser/session state and ad-hoc run droppings (never commit credentials
+# or live login state)
+session_state.json
+session_state.json.*
+*.meta.json
+*.sessionstorage.json
+*_pid.txt
+*.pid
+_s1.txt
+.kilo/
+
+# Credentials (kept on disk, must never be pushed)
+passwords_custom.txt
+passwords_full.txt
+**/passwords_*.txt
+
+# Generated job/registry state that the app rewrites at runtime
+**/clients/_registry.json
+**/*_checkpoint_*.json
+
+# Backup copies of source files
+*.bak-*
 
 # Editor and operating-system files
 .idea/

@@ -661,24 +661,30 @@ def process_order(page, order: dict, cfg: AutomationConfig,
     if plan is not None:
         # Planning already ran parse_order_products()/infer_state() once,
         # up front, with no browser involved -- PlanningError would have
-        # been raised there if there was no sellable product or no
-        # resolvable state, so those checks are not repeated here.
+        # been raised there if there was no sellable product. plan.state
+        # may be None: that means no state was inferable from the address
+        # and the state field is SKIPPED entirely (the form saves fine
+        # without it) -- no fallback, no web lookup, no wasted combobox
+        # interaction.
         #
         # Each MatchResult is copied via replace() before use. This
         # function is called multiple times against the *same* plan
         # object across lock-mode's transient-failure retries
-        # (run_automation.py's _attempt_order loop), and mutates match
+        # (run_upload.py's _attempt_order loop), and mutates match
         # objects in place (needs_manual_review, reason) to record what
         # happened on this specific attempt. Without a fresh copy, a
         # failed attempt's notes would keep stacking onto the shared
         # plan's matches and bleed into the next retry.
         matches = [replace(m) for m in plan.matches]
         state = plan.state
-        used_state_fallback = plan.used_state_fallback
-        if used_state_fallback:
-            _emit(cfg, f"[fallback] could not infer state from address "
-                       f"{order.get('address')!r} -- using fallback state "
-                       f"{state!r} (from execution plan)")
+        used_state_fallback = False
+        if state is None:
+            # Oct 2026 speed pass: no state inferable from the address ->
+            # the state field is SKIPPED entirely and the order saves
+            # without it. No fallback, no web lookup.
+            _emit(cfg, f"[speed] no state inferable from address "
+                       f"{order.get('address')!r} -- skipping the state "
+                       f"field and saving without it")
     else:
         matches = parse_order_products(order.get("product", ""), cfg.crm_catalog)
         if not matches:
@@ -691,11 +697,14 @@ def process_order(page, order: dict, cfg: AutomationConfig,
             return OrderResult(False, row_number, reason=f"product matching failed: {reasons}",
                                 timings_ms={"total_ms": _elapsed_ms()})
 
+        # Oct 2026 speed pass: local inference only. A miss no longer fails
+        # the row -- the state field is skipped and the order saves without
+        # it, exactly like the planned path above.
         state, used_state_fallback = _resolve_state(order.get("address", ""), cfg)
         if state is None:
-            return OrderResult(False, row_number,
-                                reason=f"could not infer state from address {order.get('address')!r}",
-                                timings_ms={"total_ms": _elapsed_ms()})
+            _emit(cfg, f"[speed] no state inferable from address "
+                       f"{order.get('address')!r} -- skipping the state "
+                       f"field and saving without it")
 
     matched_names = []
     try:
@@ -788,18 +797,23 @@ def process_order(page, order: dict, cfg: AutomationConfig,
             return OrderResult(False, row_number, reason=err, matched_products=matched_names,
                                 timings_ms=timings)
 
-        err = _select_combobox(dialog, page, dialog.locator(sel.combo_trigger(sel.STATE_LABEL)),
-                                state, cfg, "state", combo_state, match_mode="contains",
-                                row_number=row_number)
-        if err:
-            timings["total_ms"] = _elapsed_ms()
-            return OrderResult(False, row_number, reason=err, matched_products=matched_names,
-                                timings_ms=timings)
-        guard_err = _require_dialog_open(dialog, "selecting state", page=page, cfg=cfg, row_number=row_number)
-        if guard_err:
-            timings["total_ms"] = _elapsed_ms()
-            return OrderResult(False, row_number, reason=guard_err, matched_products=matched_names,
-                                timings_ms=timings)
+        # Oct 2026 speed pass: select the state ONLY when one was inferred.
+        # When state is None, skip the combobox entirely (open + search +
+        # confirm + post-selection guard all avoided) and go straight to
+        # the next step -- the form saves fine without a state.
+        if state is not None:
+            err = _select_combobox(dialog, page, dialog.locator(sel.combo_trigger(sel.STATE_LABEL)),
+                                    state, cfg, "state", combo_state, match_mode="contains",
+                                    row_number=row_number)
+            if err:
+                timings["total_ms"] = _elapsed_ms()
+                return OrderResult(False, row_number, reason=err, matched_products=matched_names,
+                                    timings_ms=timings)
+            guard_err = _require_dialog_open(dialog, "selecting state", page=page, cfg=cfg, row_number=row_number)
+            if guard_err:
+                timings["total_ms"] = _elapsed_ms()
+                return OrderResult(False, row_number, reason=guard_err, matched_products=matched_names,
+                                    timings_ms=timings)
 
         err = _click_next(dialog, page, cfg, "Customer -> Summary", row_number=row_number)
         if err:

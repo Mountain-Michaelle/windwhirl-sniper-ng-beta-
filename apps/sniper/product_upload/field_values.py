@@ -58,7 +58,7 @@ from typing import Optional
 
 import apps.sniper.utils.field_selectors as sel
 from apps.sniper.product_upload.product_matcher import MatchResult
-from apps.sniper.product_upload.state_engine import infer_state
+from apps.sniper.product_upload.state_engine import infer_state_memoized
 from apps.sniper.product_upload.closure_diagnostics import _emit
 from apps.sniper.product_upload import fast_waits as _fw
 
@@ -537,11 +537,8 @@ def _fill_customer_info(dialog, order: dict, cfg: AutomationConfig) -> Optional[
     return None
 
 def _resolve_state(address, cfg: AutomationConfig) -> tuple[Optional[str], bool]:
-    state = infer_state(address)
-    if state is not None:
-        return state, False
-    if cfg.state_fallback is None:
-        return None, False
-    _emit(cfg, f"[fallback] could not infer state from address {address!r} -- "
-               f"using fallback state {cfg.state_fallback!r}")
-    return cfg.state_fallback, True
+    """Local inference only (Oct 2026 speed pass): no web lookup, no Lagos
+    fallback. A miss returns (None, False) and the caller SKIPS the state
+    field entirely and saves -- the form allows saving without a state."""
+    state = infer_state_memoized(address)
+    return state, False

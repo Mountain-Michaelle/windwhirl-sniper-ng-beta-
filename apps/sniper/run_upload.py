@@ -113,7 +113,7 @@ from playwright.sync_api import sync_playwright
 from apps.sniper.nav_utils import safe_goto
 from apps.sniper.utils.auth import login_with_session_cache, MissingCredentialsError
 from apps.sniper.product_upload.add_products import (
-    AutomationConfig, process_order, to_failed_order,
+    AutomationConfig, OrderResult, process_order, to_failed_order,
     to_flagged_order, FlaggedForReview,
 )
 from apps.sniper.product_upload.dialog_controls import _force_close_any_dialog, _ComboState
@@ -130,10 +130,8 @@ from apps.sniper.product_upload.failed_ledger import (
     FailedLedger, collect_and_merge_shard_ledgers,
     partition_ledger_into_shards, _shard_ledger_path,
 )
-from apps.sniper.product_upload.planning import ExecutionPlan, PlanningError, build_execution_plan
-from apps.sniper.product_upload.state_engine import (
-    cache_lookup_source, load_state_cache, prewarm_state_cache,
-    save_state_cache,
+from apps.sniper.product_upload.planning import (
+    ExecutionPlan, PlanningError, build_execution_plan,
 )
 from apps.sniper.client_workspace import (
     WorkspaceManager, ClientWorkspace, JobLock, name_key_from_filename,
@@ -230,6 +228,139 @@ class SkippedRow:
     product: str = ""
 
 
+# =============================================================================
+# Missing-address counter (Oct 2026 speed pass)
+# =============================================================================
+# A blank address cell is a HUMAN problem, not an automation one. Policy:
+#   - sighting 1 (any run): the row is NOT uploaded; a prominent
+#     HUMAN ACTION NEEDED block in the cmd points at the exact cell
+#     (Filtered # + Customer Name + Excel row) to fix;
+#   - sighting 2 (the next run, still blank): the counter RESETS and the
+#     row proceeds automatically with the "Lagos" address default --
+#     business never blocks on it, and the human gets re-nudged every
+#     second run if it stays unfixed.
+# Counts persist per job in missing_address_counts.json (atomic tmp +
+# os.replace, merge-on-write so --workers shard children can't wipe each
+# other), keyed by order_key() -- which hashes customer+phone+product+price
+# and NOT the address, so fixing the address is what clears the flag, never
+# the flag itself.
+MISSING_ADDRESS_COUNTS_FILENAME = "missing_address_counts.json"
+
+
+def _missing_address_counts_path() -> Path:
+    return PROGRESS_DIR / MISSING_ADDRESS_COUNTS_FILENAME
+
+
+def _load_missing_address_counts() -> dict[str, int]:
+    """Read the per-job blank-address sighting counts. Missing/corrupt file
+    -> {} -- never raises, a corrupt file just restarts counting."""
+    try:
+        data = json.loads(
+            _missing_address_counts_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, count in data.items():
+        try:
+            out[str(key)] = int(count)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_missing_address_counts(counts: dict[str, int],
+                                 remove_keys: frozenset[str] = frozenset()) -> None:
+    """Persist sighting counts, MERGING with whatever is on disk first
+    (another --workers shard child may have written disjoint keys since
+    this process loaded). Last-write-wins per key, never per file. Keys in
+    remove_keys are deleted from disk too -- that is how a sighting-2 RESET
+    clears its flag instead of being resurrected by the merge. Atomic tmp +
+    os.replace so a killed process never corrupts the file. Best-effort: a
+    failed write must never fail a run."""
+    try:
+        PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+        merged: dict[str, int] = {}
+        try:
+            disk = json.loads(_missing_address_counts_path().read_text(
+                encoding="utf-8"))
+            if isinstance(disk, dict):
+                for key, count in disk.items():
+                    try:
+                        merged[str(key)] = int(count)
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            pass
+        merged.update(counts)
+        for key in remove_keys:
+            merged.pop(str(key), None)
+        tmp = _missing_address_counts_path().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(merged, indent=1, sort_keys=True),
+                       encoding="utf-8")
+        import os
+        os.replace(tmp, _missing_address_counts_path())
+    except Exception:
+        pass
+
+
+def _missing_address_flag(order: dict, row_number: int, count: int) -> None:
+    """The cmd block a human needs: exactly where the blank Address cell is,
+    what else is in the row (so it can be found even without the Filtered #
+    column), and what happens next. Noisy ON PURPOSE."""
+    sn = order.get("filtered_sn")
+    target = (f"Filtered # = {sn}" if sn
+              else f"Excel row = {order.get('excel_row', row_number)}")
+    print("=" * 70, flush=True)
+    print(f"[HUMAN ACTION NEEDED] row {row_number} - NO ADDRESS in the "
+          f"source file - row NOT uploaded (sighting {count}/2).",
+          flush=True)
+    print(f"  Fix this cell in Excel:  Address  for  {target}  "
+          f"|  Customer Name = {order.get('customer_name')!r}", flush=True)
+    print(f"  Other fields of this row: phone="
+          f"{order.get('phone_number')!r} | product="
+          f"{order.get('product')!r} | price={order.get('price')!r}",
+          flush=True)
+    print("  Then save the file and run again.", flush=True)
+    print("  If the Address cell is still empty on your NEXT run, this row "
+          "uploads automatically with 'Lagos'.", flush=True)
+    print("=" * 70, flush=True)
+
+
+def _handle_missing_address(order: dict, row_number: int,
+                            counts: dict[str, int]) -> bool:
+    """True  -> this is the FIRST sighting: flagged for a human, the row
+                must not be uploaded this run.
+    False -> second sighting: counter reset, the caller plans/uploads the
+                row normally and planning's built-in 'Lagos' default applies.
+    Side effect: the (possibly reset) count is persisted immediately, so a
+    crash right after still leaves an honest count on disk."""
+    try:
+        key = order_key(order)
+    except Exception:
+        # No dedup key computable -- treat as first sighting every time;
+        # the row will fail loudly downstream anyway.
+        _missing_address_flag(order, row_number, 1)
+        return True
+    count = counts.get(key, 0) + 1
+    if count >= 2:
+        # Second sighting: reset and let the row proceed with Lagos.
+        counts.pop(key, None)
+        _save_missing_address_counts(counts, remove_keys={key})
+        sn = order.get("filtered_sn")
+        where = f"Filtered # {sn}" if sn else f"Excel row {row_number}"
+        print(f"[address] row {row_number} ({where}, "
+              f"{order.get('customer_name')!r}): address still empty "
+              f"(2nd sighting) -- proceeding automatically with the "
+              f"'Lagos' address default.", flush=True)
+        return False
+    counts[key] = count
+    _save_missing_address_counts(counts)
+    _missing_address_flag(order, row_number, count)
+    return True
+
+
 def load_orders(path: str) -> list[dict]:
     if path.lower().endswith((".xlsx", ".xls")):
         df = pd.read_excel(path)
@@ -279,6 +410,17 @@ def load_orders(path: str) -> list[dict]:
                 product=_clean_for_report(order.get("product")),
             ))
             continue
+
+        # Oct 2026 (missing-address targeting): only once the row is known to
+        # be a real, actionable order, carry the human-facing cell
+        # identifiers so the missing-address flag block can point a person
+        # at the exact Excel cell to fix. Stamped AFTER the blank/required
+        # checks so it can never make a blank row look non-blank. Purely
+        # additive -- order_key() hashes only customer_name/phone_number/
+        # product/price, so progress dedup and the retry queue are unaffected.
+        if has_filter_column:
+            order["filtered_sn"] = _clean_for_report(row[FILTER_COLUMN])
+        order["excel_row"] = excel_row
 
         orders.append(order)
 
@@ -910,59 +1052,6 @@ def _stop_diagnostics_tracing(context, tracing_active: bool) -> None:
         pass
 
 
-def _prewarm_todo_state_cache(todo: list[tuple[int, dict]]) -> dict:
-    """FIX (Oct 2026, "temporal cache + very fast search"): resolve every
-    todo-row address the local tables + job disk cache can't answer, once, in
-    parallel, before planning -- and log each extraction (address -> state +
-    source) plus a one-line run summary. Returns a per-row summary dict
-    {row_number: (address, state_or_None, source)}. Never raises: any error
-    just means planning falls back to its sequential path exactly as before.
-    """
-    summary: dict = {}
-    if not todo:
-        return summary
-    try:
-        addresses = [o.get("address", "") for _, o in todo]
-        results = prewarm_state_cache(addresses, max_workers=8)
-        # Normalized index: two rows spelling the same address differently
-        # ("Sango ota" vs "sango  OTA") share one cache entry; the summary
-        # must resolve both spellings, not just the first-seen one.
-        norm_results: dict = {}
-        for _addr, _state in results.items():
-            norm_results.setdefault(" ".join(str(_addr).split()).lower(),
-                                    _state)
-        counts = {"local": 0, "web": 0, "disk": 0, "fallback": 0}
-        for row_number, order in todo:
-            address = order.get("address", "")
-            source = cache_lookup_source(address)
-            state = results.get(address, norm_results.get(
-                " ".join(str(address).split()).lower()))
-            if state is None and (not isinstance(address, str)
-                                  or not address.strip()):
-                state = "Lagos"
-                source = "blank->Lagos"
-            label = state if state is not None else "Lagos(fallback)"
-            print(f"[state] row {row_number}: {str(address)[:60]!r} -> "
-                  f"{label} ({source or 'local'})", flush=True)
-            if source is None or source == "local":
-                counts["local"] += 1
-            elif "disk" in source:
-                counts["disk"] += 1
-            elif (source == "blank->Lagos"
-                  or source.startswith("web-miss") or state is None):
-                counts["fallback"] += 1
-            else:
-                counts["web"] += 1
-            summary[row_number] = (address, state, source or "local")
-        print(f"[state] {len(todo)} address(es): {counts['local']} local, "
-              f"{counts['web']} web fresh, {counts['disk']} cache hits, "
-              f"{counts['fallback']} fallbacks to Lagos.", flush=True)
-    except Exception as exc:
-        print(f"[state] parallel pre-warm skipped ({exc!r}) -- planning "
-              f"resolves addresses sequentially as before.", flush=True)
-    return summary
-
-
 def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                   job_progress: ProgressTracker,
                   retry_cache: RetryCache, failed_ledger: FailedLedger,
@@ -989,9 +1078,9 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
     progress and retry_cache are file-backed, so a full restart of this
     function after a crash costs nothing: already-succeeded orders are
     skipped immediately via progress.is_done(), and anything still
-    pending is exactly where the retry queue left it. The state temporal
-    cache (job state/state_cache.json) is likewise file-backed: web
-    lookups paid in any previous session are reused, never re-paid.
+    pending is exactly where the retry queue left it. Blank-address
+    sighting counts are file-backed too (missing_address_counts.json),
+    so the first-run flag / second-run 'Lagos' cycle survives restarts.
     """
     with sync_playwright() as p:
         # PERF: keep in-page timers (fast_waits' wait_for_function
@@ -1069,6 +1158,9 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
 
             plans: dict[int, ExecutionPlan] = {}
             deterministic_failures: dict[int, str] = {}
+            # Rows flagged this run for a blank address cell (first sighting):
+            # logged as failed WITHOUT ever opening the browser.
+            missing_address_rows: set[int] = set()
             # PERF (Oct 2026, "very long waiting ... already done should not
             # be checked in the real sheet again"): planning (product match +
             # state inference, incl. the web lookup for unresolvable
@@ -1095,32 +1187,53 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
             if not todo:
                 print("[plan] everything in this file is already marked done -- "
                       "nothing to plan or upload this session.", flush=True)
-            # FIX (Oct 2026, "temporal cache ... + very fast search ... 200
-            # orders"): pre-resolve every todo-row address the local tables +
-            # disk cache can't answer, ONCE, in PARALLEL (x8 threads), BEFORE
-            # the planning loop -- so planning itself never blocks on the
-            # network row-by-row and each address's extraction is logged with
-            # its source. The loop below then hits a warm cache every time.
-            _prewarm_todo_state_cache(todo)
+            # Oct 2026 speed pass: planning is 100% local now -- no
+            # parallel web pre-warm, no state_cache.json, no Lagos
+            # fallback. Each address logs one instant line; a blank
+            # address never reaches planning at all:
+            #   sighting 1 -> HUMAN ACTION NEEDED block, row NOT uploaded;
+            #   sighting 2 -> counter resets, row proceeds with the
+            #   'Lagos' default built into planning itself.
+            from apps.sniper.product_upload import state_engine as _state_engine
+            _state_engine.clear_memo()
+            missing_address_counts = _load_missing_address_counts()
             for row_number, order in todo:
+                raw_address = order.get("address", "")
+                used_lagos_default = False
+                if not isinstance(raw_address, str) or not raw_address.strip():
+                    if _handle_missing_address(order, row_number,
+                                               missing_address_counts):
+                        # First sighting: flagged for a human, not uploaded.
+                        missing_address_rows.add(row_number)
+                        deterministic_failures[row_number] = (
+                            f"no address in the source file for "
+                            f"{order.get('customer_name')!r} (Filtered # "
+                            f"{order.get('filtered_sn') or 'n/a'}) -- fix the "
+                            f"Address cell and run again")
+                        continue
+                    # Second sighting: counter reset -- proceed automatically
+                    # with the 'Lagos' default (no parameter passed anywhere;
+                    # the default lives right here).
+                    order = {**order, "address": "Lagos"}
+                    used_lagos_default = True
                 try:
-                    plans[row_number] = build_execution_plan(
-                        order, catalog, state_fallback=cfg.state_fallback
-                    )
+                    plan = build_execution_plan(order, catalog)
                 except PlanningError as exc:
                     deterministic_failures[row_number] = str(exc)
-
-            # Persist the temporal cache right after planning: whatever the
-            # pre-warm + planning loop resolved is on disk even if the
-            # browser session crashes mid-upload (Ctrl+C safety comes from
-            # the finally-block save below).
-            try:
-                saved = save_state_cache(PROGRESS_DIR)
-                if saved:
-                    print(f"[state] saved {saved} address->state "
-                          f"resolution(s) to the job cache.", flush=True)
-            except Exception:
-                pass
+                    continue
+                if used_lagos_default:
+                    plan = dataclasses.replace(plan, used_state_fallback=True)
+                plans[row_number] = plan
+                # One instant local line per healthy row: address intact ->
+                # resolved state (or 'skipped'), then move on.
+                sn = order.get("filtered_sn")
+                where = f", Filtered # {sn}" if sn else ""
+                label = (plan.state if plan.state is not None
+                         else "no state inferable -- state field will be skipped")
+                print(f"[address] row {row_number}{where} "
+                      f"({order.get('customer_name')!r}): "
+                      f"{str(order.get('address', ''))[:60]!r} -> {label}",
+                      flush=True)
 
             # FIX (Sep 2026, "try all failed uploads FIRST on every fresh
             # run"): the failed-orders ledger drains before anything else --
@@ -1164,8 +1277,16 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                               f"identical input, so it is logged as failed once rather "
                               f"than spun on forever. Every OTHER row keeps being "
                               f"processed normally.", flush=True)
-                    result = process_order(page, order, cfg, row_number=i)
-                    result.reason = deterministic_failures[i]
+                    if i in missing_address_rows:
+                        # Blank-address row flagged in planning -- logged as
+                        # failed WITHOUT touching the browser (no wizard is
+                        # ever opened for it).
+                        result = OrderResult(False, i,
+                                             reason=deterministic_failures[i],
+                                             timings_ms={"total_ms": 0.0})
+                    else:
+                        result = process_order(page, order, cfg, row_number=i)
+                        result.reason = deterministic_failures[i]
                     counters["failed"] += 1
                     failed_order = to_failed_order(order, result)
                     failure_log.log(failed_order)
@@ -1192,13 +1313,6 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                                failure_log, failed_rows, counters, flagged_rows,
                                label="final sweep", lock_mode=lock_mode)
         finally:
-            # Ctrl+C / crash safety: persist any state resolutions learned
-            # this session (pre-warm, planning loop, drain retries) so the
-            # next run reuses them instead of re-paying the lookups.
-            try:
-                save_state_cache(PROGRESS_DIR)
-            except Exception:
-                pass
             _stop_diagnostics_tracing(context, tracing_active)
             try:
                 context.close()
@@ -1211,8 +1325,7 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
 
 
 def _run_sharded(workspace: "ClientWorkspace", workers: int, lock_mode: bool,
-                  refresh_catalog: bool, enable_tracing: bool,
-                  refresh_state_cache: bool = False) -> None:
+                  refresh_catalog: bool, enable_tracing: bool) -> None:
     """PERF (--workers N): split one client job across N independent
     browser processes, each owning a disjoint, round-robin slice of the
     order rows (row i -> shard i % N). The CRM is a hosted SPA, so the
@@ -1274,8 +1387,6 @@ def _run_sharded(workspace: "ClientWorkspace", workers: int, lock_mode: bool,
             command.append("--lock")
         if refresh_catalog:
             command.append("--refresh-catalog")
-        if refresh_state_cache:
-            command.append("--refresh-state-cache")
         if not enable_tracing:
             command.append("--no-diagnostics")
         print(f"[shard] launching worker {i + 1}/{workers} in a separate "
@@ -1317,8 +1428,7 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
          enable_tracing: bool = True, client: str | None = None,
          source: str | None = None, job: str | None = None,
          dry_run: bool = False, skip_done: bool = True,
-         workers: int = 1, shard: tuple[int, int] | None = None,
-         refresh_state_cache: bool = False) -> None:
+         workers: int = 1, shard: tuple[int, int] | None = None) -> None:
     if client:
         manager = WorkspaceManager()
         if job:
@@ -1394,24 +1504,6 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
                   f"failed-ledger file(s) from a previous run into the main ledger.")
     failed_ledger = FailedLedger(path=str(shard_ledger_path))
 
-    # FIX (Oct 2026, "repeating on each run ... temporal cache for the whole
-    # lifecycle of a particular job"): seed the state-search cache from the
-    # job's state_cache.json so web lookups paid on a previous run are never
-    # re-paid. --refresh-state-cache forces re-resolution (same role as
-    # --refresh-catalog for the product list).
-    from apps.sniper.product_upload import state_engine as _state_engine
-    _state_engine.load_state_cache(PROGRESS_DIR)
-    if refresh_state_cache:
-        for _key in list(_state_engine._SEARCH_CACHE):
-            _state_engine._SEARCH_CACHE.pop(_key, None)
-            _state_engine._SEARCH_CACHE_META.pop(_key, None)
-        try:
-            (Path(PROGRESS_DIR) / _state_engine.STATE_CACHE_FILENAME).unlink()
-        except Exception:
-            pass
-        print("[state] --refresh-state-cache passed -- ignoring any cached "
-              "address->state resolutions and re-resolving from scratch.",
-              flush=True)
 
     already_done_count = sum(1 for o in orders if progress.is_done(o))
     if already_done_count:
@@ -1568,8 +1660,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
          dry_run: bool = False, skip_done: bool = True,
          legacy: bool = False,
          skip: tuple[str, ...] = (),
-         workers: int = 1, shard: tuple[int, int] | None = None,
-         refresh_state_cache: bool = False) -> None:
+         workers: int = 1, shard: tuple[int, int] | None = None) -> None:
     """Run one explicit job or drain the inbox sequentially.
 
     The upload engine is intentionally invoked once per workspace. A completed
@@ -1586,8 +1677,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             # slice, then exit. No locks, no status writes, no cleanup.
             _run_upload(lock_mode, refresh_catalog, enable_tracing,
                         workspace.client_id, None, workspace.job_id,
-                        dry_run, skip_done, shard=shard,
-                        refresh_state_cache=refresh_state_cache)
+                        dry_run, skip_done, shard=shard)
             return
         try:
             manager.validate_client_ready(workspace.client_id)
@@ -1615,13 +1705,11 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
                 with JobLock(workspace.auth_dir / "auth.lock"):
                     if workers > 1 and not dry_run:
                         _run_sharded(workspace, workers, lock_mode,
-                                     refresh_catalog, enable_tracing,
-                                     refresh_state_cache)
+                                     refresh_catalog, enable_tracing)
                     else:
                         counts = _run_upload(lock_mode, refresh_catalog, enable_tracing,
                                              workspace.client_id, None, workspace.job_id,
-                                             dry_run, skip_done, workers=workers,
-                                             refresh_state_cache=refresh_state_cache)
+                                             dry_run, skip_done, workers=workers)
             if dry_run:
                 manager.set_job_status(
                     workspace.client_id,
@@ -1747,7 +1835,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             return execute_workspace(workspace, shard=shard)
         return _run_upload(lock_mode, refresh_catalog, enable_tracing, client,
                            source, job, dry_run, skip_done, workers=workers,
-                           shard=shard, refresh_state_cache=refresh_state_cache)
+                           shard=shard)
 
     skip_values = {item.lower() for item in skip}
     manager.recover_claimed_files()
@@ -1821,8 +1909,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             )
             return
         return _run_upload(lock_mode, refresh_catalog, enable_tracing,
-                           None, None, None, dry_run, skip_done,
-                           refresh_state_cache=refresh_state_cache)
+                           None, None, None, dry_run, skip_done)
     workspaces = list(pending_jobs)
     for inbox_file in files:
         claimed_file = manager.claim_inbox_file(inbox_file)
@@ -1885,8 +1972,6 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             command.append("--lock")
         if refresh_catalog:
             command.append("--refresh-catalog")
-        if refresh_state_cache:
-            command.append("--refresh-state-cache")
         if not enable_tracing:
             command.append("--no-diagnostics")
         if dry_run:
@@ -1942,15 +2027,6 @@ if __name__ == "__main__":
              "the cache is trusted as-is and the live scrape is skipped entirely.",
     )
     parser.add_argument(
-        "--refresh-state-cache",
-        action="store_true",
-        help="Ignore any cached address->state resolutions "
-             "(job state/state_cache.json) and re-resolve from scratch. "
-             "Use this after the local state tables gain new aliases; "
-             "otherwise the cache is trusted as-is and web lookups paid on "
-             "a previous run are never re-paid.",
-    )
-    parser.add_argument(
         "--no-diagnostics",
         action="store_true",
         help="Skip starting Playwright tracing for this run, for a bit of extra speed "
@@ -1991,7 +2067,6 @@ if __name__ == "__main__":
         except ValueError:
             raise SystemExit(f"--shard must look like '0/4', got {args.shard!r}")
     main(lock_mode=args.lock, refresh_catalog=args.refresh_catalog,
-         refresh_state_cache=args.refresh_state_cache,
          enable_tracing=not args.no_diagnostics, client=args.client,
          source=args.source, job=args.job, dry_run=args.dry_run,
          skip_done=args.skip_done,

@@ -13,14 +13,16 @@ from typing import Mapping, Optional
 from apps.sniper.product_upload.product_matcher import (
     MatchResult, parse_order_products, product_for_price,
 )
-from apps.sniper.product_upload.state_engine import infer_state_with_search
+from apps.sniper.product_upload.state_engine import infer_state_memoized
 
 
 @dataclass(frozen=True)
 class ExecutionPlan:
     order: Mapping[str, object]
     matches: tuple[MatchResult, ...]
-    state: str
+    # None = no state could be inferred from the address -> the caller
+    # SKIPS the state field entirely and saves (the form allows it).
+    state: Optional[str]
     used_state_fallback: bool = False
 
     @property
@@ -32,10 +34,16 @@ class PlanningError(ValueError):
     """A deterministic input error that must never be retried."""
 
 
+class MissingAddressError(PlanningError):
+    """The address cell is blank: there is nothing to infer a state from and
+    nothing to type into the address field. The caller (run_upload.py) flags
+    this for a human on the first sighting and proceeds with its own Lagos
+    default on the second -- planning itself never guesses."""
+
+
 def build_execution_plan(
     order: Mapping[str, object],
     catalog: list[str],
-    state_fallback: Optional[str] = "Lagos",
 ) -> ExecutionPlan:
     matches = tuple(parse_order_products(order.get("product", ""), catalog))
     if not matches or any(m.matched_product is None for m in matches):
@@ -54,38 +62,28 @@ def build_execution_plan(
             reasons = "; ".join(f"{m.excel_text!r}: {m.reason}" for m in rejected)
             raise PlanningError(f"product matching failed: {reasons}")
 
-    # Address default (Oct 2026): a blank address has nothing to infer from, so
-    # use "Lagos" for BOTH the address field and the state instead of failing
-    # the row with "could not infer state". The browser then fills a real
-    # delivery address rather than an empty box.
+    # Address default (Oct 2026): a blank address has nothing to infer from.
+    # "Lagos" is kept as the typed fill value (so the address box gets a
+    # real, verifiable string instead of pandas NaN) but planning itself
+    # raises MissingAddressError so the caller can flag it for a human first.
     effective_order = dict(order)
     raw_address = effective_order.get("address", "")
     address = raw_address
-    used_address_default = False
     if not isinstance(address, str) or not address.strip():
-        address = "Lagos"
-        effective_order["address"] = address
-        used_address_default = True
+        effective_order["address"] = "Lagos"
+        raise MissingAddressError(
+            "address cell is blank -- nothing to infer a state from and "
+            "nothing to type into the address field"
+        )
 
-    # State: local inference first (dictionaries/aliases/landmarks -- no
-    # network); only when that misses does infer_state_with_search() run its
-    # light, 2-attempt web lookup. Anything unresolved still lands on
-    # state_fallback ("Lagos") exactly as before.
-    state = infer_state_with_search(address)
-    used_fallback = False
-    if state is None:
-        if state_fallback is None:
-            raise PlanningError(
-                f"could not infer state from address {address!r}"
-            )
-        state = state_fallback
-        used_fallback = True
-    elif used_address_default:
-        used_fallback = True
+    # State: local inference only (dictionaries/aliases/landmarks -- no
+    # network, no web lookup, no Lagos fallback). A miss leaves state=None
+    # and the caller SKIPS the state field entirely and saves.
+    state = infer_state_memoized(address)
 
     return ExecutionPlan(
         order=MappingProxyType(effective_order),
         matches=matches,
         state=state,
-        used_state_fallback=used_fallback,
+        used_state_fallback=False,
     )

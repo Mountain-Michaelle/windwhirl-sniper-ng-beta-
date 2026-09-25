@@ -611,6 +611,274 @@ def test_verify_gives_up_when_nothing_confirms(monkeypatch):
     assert drv.state["delivered_calls"] == rd.VERIFY_ATTEMPTS
 
 
+def test_scan_waits_for_the_row_count_to_settle():
+    """A >1000-per-page table fills in waves; a single read would see only
+    the first viewport, so the scan polls until the count stops changing."""
+    from apps.sniper.product_deliver import scan as scan_mod
+
+    class _Page:
+        def __init__(self, counts):
+            self.counts = list(counts)
+            self.waits = 0
+
+        def evaluate(self, script, arg=None):
+            return self.counts.pop(0) if self.counts else self.counts[-1]
+
+        def wait_for_timeout(self, ms):
+            self.waits += 1
+
+    class _Driver:
+        def __init__(self, page):
+            self.page = page
+
+    # 50 -> 150 -> 259 -> 259 -> 259 (target reached, then stable)
+    page = _Page([50, 150, 259, 259, 259, 259])
+    assert scan_mod.wait_for_rows_settled(_Driver(page), target=259) == 259
+    assert page.waits >= 1
+
+
+def test_scan_settle_gives_up_and_reports_the_last_count():
+    from apps.sniper.product_deliver import scan as scan_mod
+
+    class _Page:
+        def evaluate(self, script, arg=None):
+            return 42
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    class _Driver:
+        page = _Page()
+
+    # never reaches target=999 -> returns what it actually saw, never a lie
+    assert scan_mod.wait_for_rows_settled(_Driver(), target=999,
+                                         timeout_s=1.2) == 42
+
+
+def test_scan_enrich_joins_name_blocks_and_reads_both_phone_links():
+    from apps.sniper.product_deliver.scan import enrich_rows
+
+    rows = enrich_rows([{
+        "nameParts": ["Oladunni folasade", "Ramat"],
+        "wrapText": "Oladunni folasade\nRamat",
+        "fallbackName": "Oladunni folasade",
+        "hrefs": ["tel:2348082508065", "https://wa.me/2349122762716"],
+        "orderId": "4045209933",
+        "status": "Pending",
+        "product": "1 Combo Set (1 serum & 1 Cream) ... Amount: \u20a628,500",
+    }])
+    assert len(rows) == 1
+    assert rows[0]["customer"] == "Oladunni folasade Ramat"
+    assert rows[0]["orderId"] == "4045209933"
+    assert rows[0]["amount"] == 28500
+    assert len(rows[0]["phones"]) == 2
+
+
+# ── pager walk: settle, both-signals page-turn proof, safe re-walk ──────────
+
+
+def test_scan_page_turn_needs_the_label_AND_the_first_row():
+    """The pager label flips to "Page 6 of 6" before the new rows render;
+    accepting that state re-reads the old page and stops short (250/259)."""
+    from apps.sniper.product_deliver import scan as scan_mod
+
+    class _Text:
+        def __init__(self, page):
+            self.page = page
+
+        @property
+        def first(self):
+            return self
+
+        def inner_text(self, timeout=0):
+            return self.page.labels[min(self.page.step,
+                                        len(self.page.labels) - 1)]
+
+    class _Page:
+        # step 0: old page; steps 1-3: label moved but old rows still
+        # rendered; step 4+: the new page's rows finally landed.
+        labels = ["Page 5 of 6", "Page 6 of 6", "Page 6 of 6",
+                  "Page 6 of 6", "Page 6 of 6"]
+        first_ids = ["5000001", "5000001", "5000001", "5000001", "6000001"]
+
+        def __init__(self):
+            self.step = 0
+            self.waits = 0
+
+        def get_by_text(self, pattern):
+            return _Text(self)
+
+        def evaluate(self, script, arg=None):
+            i = min(self.step, len(self.first_ids) - 1)
+            return [{"orderId": self.first_ids[i]}]
+
+        def wait_for_timeout(self, ms):
+            self.waits += 1
+            self.step += 1
+
+    page = _Page()
+    # label moved, old rows still there -> NOT turned yet
+    page.step = 1
+    assert scan_mod._page_turned(page, "Page 5 of 6", "5000001") is False
+    page.step = 0
+    assert scan_mod._wait_page_turn(page, "Page 5 of 6", "5000001",
+                                    timeout_s=5.0) is True
+    assert page.waits >= 4      # it kept waiting through the phantom window
+
+
+def test_scan_collect_settles_the_row_count_before_reading(monkeypatch):
+    """wait_for_orders_ready (first row) alone is too early: the walk must
+    also poll until the row count stops moving before the bulk read."""
+    from apps.sniper.product_deliver import scan as scan_mod
+
+    settled = []
+
+    def _settle(driver, **kw):
+        settled.append(1)
+        return 50
+
+    monkeypatch.setattr(scan_mod, "wait_for_rows_settled", _settle)
+
+    class _NoPager:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 0
+
+    class _Page:
+        def __init__(self):
+            self.rows = [{"orderId": str(1000 + i)} for i in range(50)]
+
+        def get_by_role(self, role, name=None):
+            return _NoPager()
+
+        def evaluate(self, script, arg=None):
+            return self.rows
+
+    class _Driver:
+        def __init__(self):
+            self.page = _Page()
+            self.ready_calls = 0
+
+        def wait_for_orders_ready(self, *a, **k):
+            self.ready_calls += 1
+            return True
+
+    drv = _Driver()
+    rows = scan_mod.collect_tab_pages(drv, expected=259)
+    assert len(rows) == 50
+    assert settled == [1]           # one settle before the single read
+    assert drv.ready_calls == 1
+
+
+def test_scan_short_rewalk_never_overwrites_the_first_walk(monkeypatch):
+    """250 rows first, then a 9-row retry that started on the LAST page ->
+    the union must stay 250 (the 250 -> 9 regression)."""
+    from apps.sniper.product_deliver import scan as scan_mod
+
+    walks = [
+        [{"orderId": str(i)} for i in range(250)],
+        [{"orderId": str(i)} for i in range(9)],
+    ]
+    resets = []
+    monkeypatch.setattr(scan_mod, "collect_tab_pages",
+                        lambda driver, expected=0: walks.pop(0))
+    monkeypatch.setattr(scan_mod, "_reset_to_first_page",
+                        lambda driver: resets.append(1) or True)
+    rows = scan_mod.scan_tab_pages(object(), "pending", expected=259)
+    assert resets == [1]            # the retry really started at page 1
+    assert len(rows) == 250         # short retry added nothing, lost nothing
+
+
+def test_scan_rewalk_merges_rows_the_first_walk_missed(monkeypatch):
+    from apps.sniper.product_deliver import scan as scan_mod
+
+    walks = [
+        [{"orderId": str(i)} for i in range(250)],
+        [{"orderId": str(i)} for i in range(259)],
+    ]
+    monkeypatch.setattr(scan_mod, "collect_tab_pages",
+                        lambda driver, expected=0: walks.pop(0))
+    monkeypatch.setattr(scan_mod, "_reset_to_first_page", lambda driver: True)
+    rows = scan_mod.scan_tab_pages(object(), "pending", expected=259)
+    assert len(rows) == 259         # union keeps the re-walk's extra 9 rows
+
+
+def test_scan_rewalk_is_skipped_when_the_pager_cannot_rewind(monkeypatch):
+    from apps.sniper.product_deliver import scan as scan_mod
+
+    calls = []
+    monkeypatch.setattr(
+        scan_mod, "collect_tab_pages",
+        lambda driver, expected=0: calls.append(1)
+        or [{"orderId": str(i)} for i in range(250)])
+    monkeypatch.setattr(scan_mod, "_reset_to_first_page", lambda driver: False)
+    rows = scan_mod.scan_tab_pages(object(), "pending", expected=259)
+    assert calls == [1]             # never re-walk from an unknown page
+    assert len(rows) == 250
+
+
+def test_scan_rewind_clicks_previous_until_page_one():
+    from apps.sniper.product_deliver import scan as scan_mod
+
+    class _Prev:
+        def __init__(self, page):
+            self.page = page
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 1
+
+        def is_enabled(self):
+            return self.page.n > 1
+
+        def scroll_into_view_if_needed(self, timeout=0):
+            pass
+
+        def click(self, timeout=0):
+            self.page.n -= 1
+            self.page.clicks += 1
+
+    class _Text:
+        def __init__(self, page):
+            self.page = page
+
+        @property
+        def first(self):
+            return self
+
+        def inner_text(self, timeout=0):
+            return f"Page {self.page.n} of 6"
+
+    class _Page:
+        def __init__(self):
+            self.n = 6
+            self.clicks = 0
+
+        def get_by_role(self, role, name=None):
+            return _Prev(self)
+
+        def get_by_text(self, pattern):
+            return _Text(self)
+
+        def evaluate(self, script, arg=None):
+            return [{"orderId": f"ORD{self.n}"}]
+
+    class _Driver:
+        def __init__(self):
+            self.page = _Page()
+
+    drv = _Driver()
+    assert scan_mod._reset_to_first_page(drv) is True
+    assert drv.page.n == 1
+    assert drv.page.clicks == 5      # 6 -> 5 -> 4 -> 3 -> 2 -> 1
+
+
 # ── sheet status rule: _select_work_rows + the three loaders ────────────────
 
 
@@ -730,3 +998,109 @@ def test_filtered_sn_column_keys_the_real_rows(tmp_path):
         headers=("Filtered #", "Customer Name", "Action"))
     assert rd.load_customers(path) == ["Ada", "Bola"]
     assert "entirely blank" in rd._selection_note
+
+
+
+# ── --scan-duplicate: fingerprints, grouper, ledger, CSV ────────────────────
+
+
+def _dup_row(customer="Esther", phones=("2349011882044",), amount=28500,
+             order_id="1", status="Pending", tab="pending"):
+    return {"customer": customer, "phones": list(phones), "amount": amount,
+            "orderId": order_id, "status": status, "tab": tab,
+            "product": "1 Combo Set"}
+
+
+def test_scan_fingerprint_ignores_amount_entirely():
+    # The scan rule is name + phones ONLY: the same customer + number
+    # appearing twice is already a duplicate, whatever the amounts are.
+    a = rd.customer_fingerprint("Esther", ["2349011882044"])
+    b = rd.customer_fingerprint("Esther", ["+234 901 188 2044"])
+    assert a == b
+    assert "28500" not in a and "999" not in a
+
+
+def test_scan_fingerprint_separates_different_phones():
+    assert (rd.customer_fingerprint("Esther", ["2349011882044"])
+            != rd.customer_fingerprint("Esther", ["2349122762716"]))
+
+
+def test_deliver_fingerprint_keeps_the_amount():
+    # The deliver flow keeps the Amount on purpose: there, two identical
+    # copies really are the double upload, not two different orders.
+    assert (rd.order_fingerprint("Esther", ["2349011882044"], 28500)
+            != rd.order_fingerprint("Esther", ["2349011882044"], 30000))
+
+
+def test_grouper_flags_only_groups_with_two_or_more_copies():
+    rows = [
+        _dup_row(order_id="7829068724"),
+        _dup_row(order_id="8626500351"),          # duplicate of the above
+        _dup_row(customer="Ken", phones=["2349011882043"], order_id="92399"),
+        _dup_row(customer="Esther", phones=["2349122762716"],
+                 order_id="777"),                 # same name, other number
+    ]
+    scan_groups = rd.groups_from_rows(rows, rd.customer_key)
+    assert len(scan_groups) == 1
+    key, copies = scan_groups[0]
+    assert sorted(c["orderId"] for c in copies) == ["7829068724", "8626500351"]
+    # The same-name/different-phone row is never grouped in.
+    deliver_groups = rd.groups_from_rows(rows, rd.order_key)
+    assert len(deliver_groups) == 1               # only the true pair
+
+
+def test_grouper_skips_rows_without_a_name():
+    rows = [_dup_row(customer="", order_id="1"), _dup_row(customer="",
+                                                        order_id="2")]
+    assert rd.groups_from_rows(rows, rd.customer_key) == []
+
+
+def test_grouper_handles_three_copies():
+    rows = [_dup_row(order_id=str(n)) for n in (1, 2, 3)]
+    groups = rd.groups_from_rows(rows, rd.customer_key)
+    assert len(groups) == 1 and len(groups[0][1]) == 3
+
+
+def test_duplicate_csv_is_appended_once_per_copy(tmp_path):
+    csv_path = tmp_path / "duplicates.csv"
+    copies = [_dup_row(order_id="7829068724"), _dup_row(order_id="8626500351")]
+    first = rd.export_duplicate(csv_path, copies, client="client_x",
+                                source="", run_id="scan_1", match="name+phones",
+                                fingerprint="esther|2349011882044")
+    assert first == 2
+    # A re-scan of the same copies must not grow the file.
+    second = rd.export_duplicate(csv_path, copies, client="client_x",
+                                 source="", run_id="scan_2",
+                                 match="name+phones",
+                                 fingerprint="esther|2349011882044")
+    assert second == 0
+    import csv as _csv
+    with open(csv_path, encoding="utf-8-sig", newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert len(rows) == 2
+    assert rows[0]["match"] == "name+phones"
+    assert rows[0]["copies"] == "2"
+
+
+def test_ledger_remembers_copies_and_the_handled_one(tmp_path):
+    ledger = rd.DuplicateLedger(tmp_path / "duplicates.json")
+    fp = rd.order_fingerprint("Esther", ["2349011882044"], 28500)
+    ledger.remember(fp, name="Esther", amount=28500,
+                    phones=["2349011882044"],
+                    order_ids=["7829068724", "8626500351"],
+                    handled_id="7829068724", action="delivered")
+    reloaded = rd.DuplicateLedger.load(tmp_path / "duplicates.json")
+    assert reloaded.handled(fp) == "7829068724"
+    assert reloaded.known_ids(fp) == {"7829068724", "8626500351"}
+
+
+def test_enrich_rows_joins_name_blocks_and_reads_phones():
+    raw = [{"nameParts": ["Oladunni folasade", "Ramat"], "wrapText": "",
+            "fallbackName": "Oladunni folasade",
+            "hrefs": ["tel:2348082508065", "https://wa.me/2349122762716"],
+            "orderId": "4045209933", "status": "Pending",
+            "product": "1 Combo Set"}]
+    rows = rd.enrich_rows(raw)
+    assert rows[0]["customer"] == "Oladunni folasade Ramat"
+    assert "2348082508065" in "".join(rows[0]["phones"])
+    assert rows[0]["orderId"] == "4045209933"

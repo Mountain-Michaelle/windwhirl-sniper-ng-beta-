@@ -458,6 +458,18 @@ def main() -> None:
                         help="where to export names found in neither "
                              "Pending nor Delivered (default: <client>/"
                              "state/deliver/not_found.csv)")
+    parser.add_argument("--scan-duplicate", action="store_true",
+                        help="READ-ONLY: scan the live CRM list for duplicate "
+                             "uploads (name + phone fingerprints) and export "
+                             "them to the client's CSV; never saves an order")
+    parser.add_argument("--scan-tab", default="pending",
+                        choices=("pending", "both"),
+                        help="--scan-duplicate: scan Pending only, or "
+                             "'both' to also scan Delivered (catches a copy "
+                             "that already moved)")
+    parser.add_argument("--duplicates-csv", default="",
+                        help="where to export duplicate copies (default: "
+                             "<client>/state/deliver/duplicates.csv)")
     parser.add_argument("--verbose", action="store_true",
                         help="detailed step-by-step logging")
     args = parser.parse_args()
@@ -467,23 +479,44 @@ def main() -> None:
         except Exception:                             # noqa: BLE001
             pass
 
-    if not args.mark_deliver:
-        print("[deliver] nothing to do -- add --mark-deliver. Example:")
-        print("  python run_deliver.py --client michael "
-              "--mark-deliver --lock")
-        return
-
     manager = WorkspaceManager()
-    distribute_inbox(manager)
-
     config = load_config(Path(args.config) if args.config else None)
     if args.period and args.period != DEFAULT_PERIOD:
         config["period"] = args.period
-
     canonical = manager.resolve_client_id(args.client)
     job_log = _install_job_log(manager, canonical)
     if job_log:
         print(f"[deliver] job log: {job_log}", flush=True)
+
+    if args.scan_duplicate:
+        # Read-only: no Excel look-up, no order saved, no state changed.
+        # Skips the customer-file loading the deliver path needs.
+        from apps.sniper.product_deliver.scan import scan_duplicates
+        try:
+            scan_duplicates(
+                canonical, config, headful=not args.headless,
+                tab=args.scan_tab, verbose=args.verbose,
+                duplicates_csv=(Path(args.duplicates_csv)
+                                if args.duplicates_csv else None))
+        except MissingCredentialsError:
+            raise
+        except KeyboardInterrupt:
+            print("[scan] stopped by user.", flush=True)
+        except Exception as exc:                      # noqa: BLE001
+            if args.verbose:
+                traceback.print_exc()
+            print(f"[scan] scan ended with error: {type(exc).__name__}: {exc}",
+                  flush=True)
+        return
+
+    if not args.mark_deliver:
+        print("[deliver] nothing to do -- add --mark-deliver (or "
+              "--scan-duplicate for a read-only duplicate check). Example:")
+        print("  python run_deliver.py --client michael "
+              "--mark-deliver --lock")
+        return
+
+    distribute_inbox(manager)
     if args.customers:
         source = Path(args.customers)
     else:
