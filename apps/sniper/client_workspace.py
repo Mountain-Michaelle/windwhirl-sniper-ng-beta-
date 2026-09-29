@@ -11,17 +11,64 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+# The repo root has to be importable before the absolute `apps.sniper.*`
+# import below. Two ways this module gets loaded:
+#   * as a package module  -- `from apps.sniper.client_workspace import ...`
+#     (run_upload, product_deliver, the test suite): the root is already on
+#     sys.path.
+#   * as a top-level module -- `python client_manager.py init` run from inside
+#     apps/sniper, where client_manager's `from client_workspace import ...`
+#     fallback puts ONLY apps/sniper on sys.path, and `apps` does not resolve.
+# That second path is how the CLI is documented to be run, so this module has
+# to bootstrap the root itself rather than assume a caller did it. Same
+# _PROJECT_ROOT idiom as run_upload.py / run_deliver.py / migrate_progress_to_db.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from apps.sniper.conditional_wait import poll_until  # noqa: E402
+
 ORDER_FILE_EXTENSIONS = (".csv", ".xlsx", ".xls")
+# How long a lock file that exists but won't parse is given to become
+# readable. The owner writes its pid in a single os.write right after the
+# atomic create, so this only has to cover that write; anything still
+# unreadable after it is treated as a genuinely corrupt lock (stale).
+_LOCK_WRITE_GRACE_S = 0.5
+# Total budget for acquiring the client-registry lock. Identical to the old
+# 100 x 0.05s loop it replaces; only the retry granularity changed.
+_REGISTRY_LOCK_WAIT_S = 5.0
 _DUPLICATE_SUFFIX_RE = re.compile(
     r"(\s*\(\d+\)\s*$)|(\s*-\s*copy\s*\d*\s*$)|(\s*_copy\s*\d*\s*$)",
     re.IGNORECASE,
 )
 _ENV_VAR_RE = re.compile(r"^([A-Z0-9_]+)_(EMAIL|PASSWORD)=", re.MULTILINE)
+
+# --- single-active-job policy -------------------------------------------------
+# Every client keeps EXACTLY ONE live job folder. A job leaves the live jobs
+# directory through exactly one of three archive buckets, and each bucket is
+# terminal -- nothing in `archive/` is ever picked up as work again unless it
+# is a *completed* job whose durable state still holds un-uploaded orders
+# (see discover_pending_jobs).
+#   completed  -- the job finished; history, may be restored if uploads remain
+#   superseded -- a newer inbox file replaced it; never restored
+#   orphan     -- a job_* directory with no manifest (import crashed); junk
+ARCHIVE_BUCKETS = ("completed", "superseded", "orphan")
+# A live directory only counts as a job when it carries this prefix AND a
+# job.json. Both guards matter: `jobs/status/` holds a human workbook and must
+# never be mistaken for a job or swept into the orphan bucket.
+MANAGED_JOB_GLOB = "job_*"
+# Archived jobs with nothing left to upload are moved out of the client tree
+# into `clients/_graveyard/` once they are this old. A move, never a delete --
+# the immutable source copy inside a job is data, and retention should make
+# history out of the way, not destroy it.
+ARCHIVE_RETENTION_DAYS = 14
+GRAVEYARD_DIRNAME = "_graveyard"
 
 
 def _read_json_file(path: Path):
@@ -37,12 +84,100 @@ def _read_json_file(path: Path):
         return None
 
 
+def _job_order_key(job_dir: Path, manifest: dict) -> tuple:
+    """Sort key putting a client's jobs oldest-first, so "the newest one" is
+    always simply the last entry of `live_jobs()`.
+
+    Prefers the manifest's created_at (stable, survives a directory copy) and
+    falls back to directory mtime for manifests written before the field
+    existed; ties break on the job id, which embeds its own timestamp.
+    """
+    created = str(manifest.get("created_at") or "")
+    stamp = _parse_utc_stamp(created)
+    if stamp is None:
+        try:
+            return (job_dir.stat().st_mtime, job_dir.stat().st_mtime,
+                    str(manifest.get("job_id") or job_dir.name))
+        except OSError:
+            return (0.0, 0.0, str(manifest.get("job_id") or job_dir.name))
+    try:
+        # Second-resolution created_at is the primary key, but two files can
+        # be imported inside the same second; the directory's sub-second
+        # mtime is what actually separates them, so the newest import still
+        # wins instead of an arbitrary digest order.
+        fine = job_dir.stat().st_mtime
+    except OSError:
+        fine = stamp
+    return (stamp, fine, str(manifest.get("job_id") or job_dir.name))
+
+
+def _parse_utc_stamp(value: str) -> Optional[float]:
+    """Epoch seconds for the manifests' `%Y-%m-%dT%H:%M:%SZ` timestamps."""
+    if not value:
+        return None
+    try:
+        return time.mktime(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _archive_timestamp(job_dir: Path, manifest: dict) -> Optional[float]:
+    """When a job last changed state -- used only by archive retention."""
+    for key in ("updated_at", "archived_at", "created_at"):
+        stamp = _parse_utc_stamp(str(manifest.get(key) or ""))
+        if stamp is not None:
+            return stamp
+    try:
+        return job_dir.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _job_lock_is_held(job_dir: Path) -> bool:
+    """True when a live process currently owns this job's lock.
+
+    An unparseable lock is treated as held: the only thing worse than leaving
+    one stale job folder around is yanking a directory out from under a run
+    that is mid-upload.
+    """
+    lock = job_dir / "locks" / "job.lock"
+    if not lock.exists():
+        return False
+    return _lock_owner_verdict(lock) is not False
+
+
 class AmbiguousClientError(ValueError):
     pass
 
 
 class DuplicateJobError(ValueError):
     pass
+
+
+def _lock_owner_verdict(path: Path) -> Optional[bool]:
+    """Decide whether a lock file's owner is alive.
+
+    Returns:
+      True  -- the file parsed and its pid is running: the lock is real.
+      False -- the file parsed and its pid is gone: definitively stale.
+      None  -- the file does not parse *yet*; give it a moment.
+
+    The three-way result is what makes the dynamic wait safe. A live owner
+    writes its pid in a single os.write right after the atomic create, so
+    "exists but unparseable" is almost always "caught mid-write". The old
+    code slept a fixed 100ms and re-read exactly ONCE, so a lock that
+    finished writing even a microsecond later was still misread as corrupt
+    and stolen from a live owner. Polling only the ambiguous None case
+    closes that window, while still answering True/False the instant it is
+    knowable -- a definitively dead owner never pays the grace period.
+    """
+    try:
+        owner = json.loads(path.read_text(encoding="utf-8"))
+        pid = int(owner.get("pid", 0))
+    except (OSError, ValueError, TypeError, AttributeError,
+            json.JSONDecodeError):
+        return None          # unreadable: ambiguous, keep waiting
+    return _pid_alive(pid)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -89,25 +224,23 @@ class JobLock:
         try:
             self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
         except FileExistsError as exc:
-            stale = False
-            try:
-                owner = json.loads(self.path.read_text(encoding="utf-8"))
-                pid = int(owner.get("pid", 0))
-                if not _pid_alive(pid):
-                    stale = True
-            except (ValueError, TypeError, json.JSONDecodeError):
-                time.sleep(0.1)
-                try:
-                    owner = json.loads(self.path.read_text(encoding="utf-8"))
-                    if not _pid_alive(int(owner.get("pid", 0))):
-                        stale = True
-                except (ValueError, TypeError, json.JSONDecodeError):
-                    stale = True
-            if stale:
-                self.path.unlink(missing_ok=True)
-                self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            else:
+            verdict = _lock_owner_verdict(self.path)
+            if verdict is None:
+                # Exists but unreadable -- almost certainly the owner is still
+                # mid-write. DYNAMIC WAIT (was a flat time.sleep(0.1) followed
+                # by exactly ONE re-read, which could still lose the race and
+                # steal a lock from a live owner). Only the ambiguous case is
+                # polled; a live or a dead owner is decided immediately.
+                verdict = poll_until(lambda: _lock_owner_verdict(self.path),
+                                     _LOCK_WRITE_GRACE_S)
+            # Only a *live* owner means "already running". False and None are
+            # both recoverable: a dead owner and a file that never became
+            # parseable both fall through to the stale-takeover below, exactly
+            # as the old single-re-read logic did.
+            if verdict is True:
                 raise RuntimeError(f"job is already running: {self.path}") from exc
+            self.path.unlink(missing_ok=True)
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
         os.write(self.fd, json.dumps({
             "pid": os.getpid(),
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -151,6 +284,59 @@ def _atomic_json_write(path: Path, value: object) -> None:
     os.replace(tmp, path)
 
 
+def _manifest_source_digests(manifest: dict) -> set[str]:
+    """Every content digest a job manifest claims to own.
+
+    A job may cover several order files (see ``import_inbox``), so the legacy
+    single ``source_sha256`` field is only the FIRST source. Reading just that
+    field would let the same file be imported twice once a second source is
+    appended, so every consumer of "has this file already been imported?"
+    must ask this helper instead.
+    """
+    digests: set[str] = set()
+    primary = manifest.get("source_sha256")
+    if primary:
+        digests.add(primary)
+    for entry in manifest.get("sources") or []:
+        if isinstance(entry, dict) and entry.get("sha256"):
+            digests.add(entry["sha256"])
+    return digests
+
+
+def _manifest_source_names(manifest: dict) -> list[str]:
+    """Ordered, stored filenames of every source a job covers, oldest first.
+
+    Falls back to the single legacy ``source_filename`` for manifests written
+    before multi-source jobs existed, so old jobs keep resolving without a
+    migration pass.
+    """
+    names: list[str] = []
+    for entry in manifest.get("sources") or []:
+        if isinstance(entry, dict) and entry.get("filename"):
+            names.append(entry["filename"])
+    if not names and manifest.get("source_filename"):
+        names.append(manifest["source_filename"])
+    return names
+
+
+def _unique_destination(job_dir: Path, stem: str, suffix: str) -> Path:
+    """A free, descriptive source filename inside ``job_dir``.
+
+    The first file of a job keeps the historical ``<name>_<client_id><ext>``
+    name so existing reports and the delivery side keep resolving it. Every
+    appended file gets its digest appended, which is unique per content and
+    therefore idempotent: re-importing the same content is rejected earlier by
+    the digest check rather than colliding here.
+    """
+    candidate = job_dir / f"{stem}{suffix}"
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while (job_dir / f"{stem}_{n}{suffix}").exists():
+        n += 1
+    return job_dir / f"{stem}_{n}{suffix}"
+
+
 @dataclass(frozen=True)
 class ClientPaths:
     client_id: str
@@ -178,6 +364,13 @@ class ClientWorkspace:
     diagnostics_dir: Path
     run_dir: Path
     job_lock_path: Path
+    # Every order file this job covers, oldest first. `source_path` is the
+    # FIRST entry and stays authoritative for anything that still treats the
+    # job as single-file (plan/report headers, the delivery side, the CRM
+    # page title). The upload runner is the one consumer that must read the
+    # whole tuple -- see load_orders_multi. Kept as a tuple so the frozen
+    # dataclass stays hashable and callers cannot mutate it behind our back.
+    source_paths: tuple = ()
 
 
 class WorkspaceManager:
@@ -211,13 +404,30 @@ class WorkspaceManager:
                 self.fd = None
 
             def __enter__(self):
-                for _ in range(100):
-                    try:
-                        self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                        return self
-                    except FileExistsError:
-                        time.sleep(0.05)
-                raise TimeoutError(f"Timed out acquiring registry lock {self.path}")
+                # DYNAMIC WAIT (was `for _ in range(100): ... time.sleep(0.05)`
+                # -- a flat 50ms tick, up to 100 of them). The lock is released
+                # by unlinking the file, which happens whenever it happens, so
+                # the old loop kept sleeping in 50ms quanta after the
+                # contention was already over. poll_until retries on a short
+                # backing-off schedule and returns the instant the create
+                # succeeds.
+                #
+                # Unchanged: the same 100 x 0.05s = 5s budget, and the same
+                # TimeoutError with the same message when it expires.
+                got = poll_until(self._try_create, _REGISTRY_LOCK_WAIT_S)
+                if got is None:
+                    raise TimeoutError(
+                        f"Timed out acquiring registry lock {self.path}")
+                return self
+
+            def _try_create(self):
+                """One non-blocking attempt: returns self on success, None if
+                the lock is currently held by someone else."""
+                try:
+                    self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                except FileExistsError:
+                    return None
+                return self
 
             def __exit__(self, *_):
                 if self.fd is not None:
@@ -540,25 +750,31 @@ class WorkspaceManager:
 
         FIX (Sep 2026, "file in use" / authorization noise at completion):
         this used to be a single shutil.move() whose PermissionError made
-        the caller mark the fully-succeeded job "failed". Now:
-          1. the move is retried with a short backoff, absorbing whatever
-             handle was transiently holding a file inside the job
-             directory (SQLite WAL, antivirus scan, indexer);
-          2. if it still cannot move, the manifest is flagged
-             archive_deferred=true and this returns None -- the job STAYS
-             "completed" (a filesystem hiccup never downgrades it to
-             "failed"), and retry_deferred_archives() moves it on a later
-             run without opening a browser.
+        the caller mark the fully-succeeded job "failed". Now the move is
+        retried with a short backoff and, if it still cannot land, the
+        manifest is flagged archive_deferred -- see _move_job_to_archive.
+        """
+        return self._move_job_to_archive(client_id, job_id, "completed")
+
+    def _move_job_to_archive(self, client_id: str, job_id: str,
+                             bucket: str) -> Path | None:
+        """Atomically move one live job directory into jobs/archive/<bucket>.
+
+        Returns the destination, or None when the filesystem refused the
+        move -- in which case the manifest is flagged archive_deferred so
+        retry_deferred_archives() finishes the job on a later run without
+        ever opening a browser. A filesystem hiccup never downgrades a
+        succeeded job to "failed" and never loses a byte of it.
         """
         paths = self.client_paths(client_id)
         job_dir = paths.jobs_dir / job_id
         if not job_dir.is_dir():
             return None
-        archive_dir = paths.jobs_dir / "archive" / "completed"
+        archive_dir = paths.jobs_dir / "archive" / bucket
         archive_dir.mkdir(parents=True, exist_ok=True)
         destination = archive_dir / job_id
         if destination.exists():
-            raise FileExistsError(f"Completed job archive already exists: {destination}")
+            raise FileExistsError(f"Job archive already exists: {destination}")
         last_exc: Exception | None = None
         for delay in (0.0, 0.25, 0.5, 1.0, 2.0):
             if delay:
@@ -585,9 +801,185 @@ class WorkspaceManager:
                 last_exc = exc
                 if destination.exists():
                     shutil.rmtree(destination, ignore_errors=True)
-        self.set_job_status(client_id, job_id, "completed", archive_deferred=True,
+        # The move failed, but the job's STATUS was already decided by the
+        # caller (completed / superseded), so re-write the manifest with the
+        # deferral flags and leave the status exactly as it is. Retrying the
+        # archive later must never resurrect or reclassify the job.
+        current = _read_json_file(job_dir / "job.json")
+        current_status = (current.get("status", "imported")
+                          if isinstance(current, dict) else "imported")
+        self.set_job_status(client_id, job_id, current_status,
+                            archive_deferred=True, archive_bucket=bucket,
                             archive_error=repr(last_exc))
         return None
+
+    def live_jobs(self, client_id: str) -> list[tuple[Path, dict]]:
+        """Live (non-archived) job directories for one client, oldest first.
+
+        Only `job_*` directories carrying a parseable job.json count -- that
+        is what keeps `jobs/status/` (a human workbook) and half-written
+        import residue out of the queue.
+        """
+        jobs_dir = self.client_paths(client_id).jobs_dir
+        found: list[tuple[Path, dict]] = []
+        if not jobs_dir.exists():
+            return found
+        for job_dir in jobs_dir.glob(MANAGED_JOB_GLOB):
+            manifest = _read_json_file(job_dir / "job.json")
+            if isinstance(manifest, dict):
+                found.append((job_dir, manifest))
+        return sorted(found, key=lambda item: _job_order_key(item[0], item[1]))
+
+    def supersede_other_jobs(self, client_id: str, keep_job_id: str,
+                             reason: str) -> list[str]:
+        """Enforce one-live-job-per-client: archive every live job except
+        `keep_job_id` as "superseded", returning human-readable log lines.
+
+        FIX (Sep 2026, "Michael had two job folders and the run picked the
+        stale CSV while his fresh xlsx sat idle"): import_inbox only
+        de-duplicated by content hash, so re-sending a corrected file simply
+        ADDED a second live job. Both stayed discoverable, the scheduler took
+        the one that sorted first, and the client's newest spreadsheet never
+        ran. The newest import now wins outright:
+
+          * the loser's status becomes the terminal "superseded", so
+            discover_pending_jobs can never hand it out again;
+          * its whole directory -- immutable source, state/, progress.db,
+            reports -- moves to jobs/archive/superseded/, so nothing the
+            client already uploaded is rewritten, and nothing is deleted;
+          * a job whose lock is held by a live process is NEVER pulled out
+            from under that run (it is reported as busy instead);
+          * if the filesystem refuses the move, the job still becomes
+            "superseded" (that alone removes it from the queue) and
+            retry_deferred_archives finishes the move on a later run.
+        """
+        lines: list[str] = []
+        for job_dir, _manifest in self.live_jobs(client_id):
+            job_id = job_dir.name
+            if job_id == keep_job_id:
+                continue
+            if _job_lock_is_held(job_dir):
+                lines.append(f"job {job_id} is still running (lock held) -- "
+                             f"left live; it will supersede once its run ends")
+                continue
+            pending = self.job_has_pending_uploads(client_id, job_id)
+            self.set_job_status(
+                client_id, job_id, "superseded",
+                superseded_by=keep_job_id,
+                superseded_reason=reason,
+                superseded_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            )
+            moved = self._move_job_to_archive(client_id, job_id, "superseded")
+            lines.append(
+                f"job {job_id} superseded by {keep_job_id} "
+                f"[{'live, archive deferred' if moved is None else 'archived'}]"
+                + (", un-uploaded orders travelled with it to the archive"
+                   if pending else ""))
+        return lines
+
+    def enforce_single_active_job(self) -> list[str]:
+        """Sweep every client back to at most one live job (newest wins).
+
+        Called before job discovery so the rule also repairs workspaces that
+        accumulated several live jobs before the policy existed -- exactly
+        Michael's directory, where a stale CSV and a fresh xlsx lived side by
+        side.
+        """
+        lines: list[str] = []
+        for client_id in self.known_client_ids():
+            live = [job_dir.name for job_dir, manifest in self.live_jobs(client_id)
+                    if manifest.get("status", "imported") != "superseded"]
+            if len(live) < 2:
+                continue
+            lines.extend(
+                f"client {client_id}: {line}"
+                for line in self.supersede_other_jobs(
+                    client_id, live[-1],
+                    "a newer job folder is active for this client"))
+        return lines
+
+    def quarantine_orphan_job_dirs(self) -> list[str]:
+        """Move `job_*` directories that have no manifest into archive/orphan.
+
+        An import that died between mkdir and the manifest write left a folder
+        that looked like a job to a human and like nothing at all to the
+        queue -- permanently invisible clutter sitting in the client's
+        directory forever (Michael's `job_20260916_161104_ecbfe27d`).
+        """
+        lines: list[str] = []
+        for client_id in self.known_client_ids():
+            jobs_dir = self.client_paths(client_id).jobs_dir
+            if not jobs_dir.exists():
+                continue
+            for job_dir in sorted(jobs_dir.glob(MANAGED_JOB_GLOB)):
+                if not job_dir.is_dir() or (job_dir / "job.json").exists():
+                    continue
+                destination = jobs_dir / "archive" / "orphan" / job_dir.name
+                try:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.exists():
+                        continue
+                    shutil.move(str(job_dir), str(destination))
+                except OSError as exc:
+                    lines.append(f"could not quarantine orphan {job_dir}: {exc}")
+                    continue
+                lines.append(f"quarantined manifest-less job folder "
+                             f"{job_dir.name} -> {destination}")
+        return lines
+
+    def prune_job_archives(self,
+                           retention_days: int = ARCHIVE_RETENTION_DAYS,
+                           now: Optional[float] = None) -> list[str]:
+        """Move settled archived jobs into clients/_graveyard/.
+
+        "Settled" means archived longer than `retention_days` AND holding
+        nothing left to upload (no retry queue, no failed ledger), so pruning
+        can never throw away work in progress. The move is reversible by
+        design: the client's jobs tree gets quiet, but no source file is ever
+        deleted -- the immutable copy inside a job is the record of what the
+        client sent us.
+        """
+        if not retention_days or retention_days <= 0:
+            return []
+        cutoff = (now if now is not None else time.time()) - retention_days * 86400
+        graveyard = self.root / GRAVEYARD_DIRNAME
+        lines: list[str] = []
+        for client_id in self.known_client_ids():
+            jobs_dir = self.client_paths(client_id).jobs_dir
+            for bucket in ("completed", "superseded"):
+                archive_dir = jobs_dir / "archive" / bucket
+                if not archive_dir.exists():
+                    continue
+                for job_dir in sorted(archive_dir.iterdir()):
+                    manifest = _read_json_file(job_dir / "job.json")
+                    if not isinstance(manifest, dict):
+                        continue
+                    stamp = _archive_timestamp(job_dir, manifest)
+                    if stamp is None or stamp > cutoff:
+                        continue
+                    if self.job_has_pending_uploads(client_id, job_dir.name):
+                        continue
+                    destination = graveyard / client_id / job_dir.name
+                    if destination.exists():
+                        destination = destination.parent / f"{job_dir.name}.2"
+                    try:
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(job_dir), str(destination))
+                    except OSError as exc:
+                        lines.append(f"could not prune {job_dir.name}: {exc}")
+                        continue
+                    lines.append(f"pruned archived job {job_dir.name} "
+                                 f"-> {destination}")
+        return lines
+
+    def known_client_ids(self) -> list[str]:
+        """Every client id the registry knows about, sorted."""
+        registry = self._load_registry().get("name_keys", {})
+        return sorted({
+            client_id
+            for values in registry.values()
+            for client_id in (values if isinstance(values, list) else [values])
+        })
 
     def resolve_client_id(self, client: str) -> str:
         """Canonical client id for `client` -- direct directory name or a
@@ -610,7 +1002,8 @@ class WorkspaceManager:
     def _candidate_job_dirs(self, client_id: str, job_id: str) -> list[Path]:
         paths = self.client_paths(client_id)
         return [paths.jobs_dir / job_id,
-                paths.jobs_dir / "archive" / "completed" / job_id]
+                *(paths.jobs_dir / "archive" / bucket / job_id
+                  for bucket in ARCHIVE_BUCKETS)]
 
     def read_job_status(self, client_id: str, job_id: str) -> Optional[str]:
         """Status string from the job manifest, or None when the job does
@@ -663,7 +1056,65 @@ class WorkspaceManager:
                     f"{archived} {job_dir}{deferred}")
         return None
 
-    def _job_paths(self, client_id: str, job_id: str, source_path: Path, run_id: str) -> ClientWorkspace:
+    def job_source_files(
+        self, client_id: str, job_id: str, fallback: Path
+    ) -> tuple:
+        """Every order file this job covers, in manifest order.
+
+        The manifest is the authority on what a job owns, so it is read first
+        and each entry is resolved on disk. ``fallback`` (the workspace's
+        single ``source_path``) is used for a job written before multi-source
+        support, and as the safety net if the manifest is unreadable or names
+        files that are no longer there -- a job must never silently shrink to
+        fewer orders than it was imported with, and it must never report zero
+        sources when a real file is in hand.
+
+        Order is manifest order, i.e. oldest import first, so a job is always
+        read the same way regardless of how many files were appended.
+        """
+        job_dir = self.client_paths(client_id).jobs_dir / job_id
+        manifest = _read_json_file(job_dir / "job.json")
+        if not isinstance(manifest, dict):
+            return (fallback,)
+        entries = manifest.get("sources")
+        resolved: list[Path] = []
+        seen: set[str] = set()
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("filename")
+                if not name:
+                    continue
+                candidate = job_dir / str(name)
+                # Guard against a manifest that tries to escape job_dir.
+                if candidate.parent != job_dir or not candidate.is_file():
+                    continue
+                if candidate.name in seen:
+                    continue
+                seen.add(candidate.name)
+                resolved.append(candidate)
+        if not resolved:
+            return (fallback,)
+        # Manifest order, oldest import first, exactly as the manifest records
+        # it. `fallback` (== source_path, the file the caller resolved) is only
+        # appended if the manifest somehow did not list it; it is not forced to
+        # the front, because a job must be read the same way on every run no
+        # matter which file the caller happened to pass. source_path is a
+        # separate field for any legacy consumer that needs that one file.
+        ordered = list(resolved)
+        if fallback not in ordered:
+            ordered.append(fallback)
+        return tuple(ordered)
+
+    def _job_paths(
+        self,
+        client_id: str,
+        job_id: str,
+        source_path: Path,
+        run_id: str,
+        source_paths: tuple = (),
+    ) -> ClientWorkspace:
         paths = self.ensure_client_provisioned(client_id)
         job_dir = paths.jobs_dir / job_id
         run_dir = job_dir / "runs" / run_id
@@ -673,6 +1124,7 @@ class WorkspaceManager:
             job_id=job_id,
             job_dir=job_dir,
             source_path=source_path,
+            source_paths=source_paths or (source_path,),
             auth_dir=paths.auth_dir,
             catalog_dir=paths.catalog_dir,
             progress_dir=job_dir / "state",
@@ -724,13 +1176,7 @@ class WorkspaceManager:
         batch flow -- no browser, never raises. Returns the number of
         jobs successfully archived now."""
         archived_now = 0
-        registry = self._load_registry().get("name_keys", {})
-        client_ids = {
-            client_id
-            for values in registry.values()
-            for client_id in (values if isinstance(values, list) else [values])
-        }
-        for client_id in sorted(client_ids):
+        for client_id in self.known_client_ids():
             jobs_dir = self.client_paths(client_id).jobs_dir
             if not jobs_dir.exists():
                 continue
@@ -738,9 +1184,16 @@ class WorkspaceManager:
                 manifest = _read_json_file(job_dir / "job.json")
                 if not isinstance(manifest, dict):
                     continue
-                if manifest.get("status") != "completed" or not manifest.get("archive_deferred"):
+                if not manifest.get("archive_deferred"):
                     continue
-                if self.archive_completed_job(client_id, job_dir.name) is not None:
+                # Resume into the bucket the job was headed for. A superseded
+                # job whose move was deferred must NEVER be retried into the
+                # completed bucket -- that would make dead work live again.
+                bucket = manifest.get("archive_bucket") or "completed"
+                if bucket not in ARCHIVE_BUCKETS:
+                    bucket = "completed"
+                if self._move_job_to_archive(client_id, job_dir.name,
+                                             bucket) is not None:
                     archived_now += 1
                     print(f"[archive] deferred job {job_dir.name} archived now.",
                           flush=True)
@@ -801,19 +1254,144 @@ class WorkspaceManager:
         resolved_client_id = resolved_client_id or self.resolve_canonical_client_id(key)
         paths = self.ensure_client_provisioned(resolved_client_id, key)
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        live_job_dirs = [
+            job_dir
+            for job_dir, _manifest in self.live_jobs(resolved_client_id)
+            if job_dir.parent == paths.jobs_dir
+        ]
+        # The live job that may still be worked on, if any. Settled history
+        # (completed/failed_final/cancelled/superseded) is NOT reopened -- its
+        # counts and report must stay stable -- so only a genuinely open job is
+        # a candidate to receive an appended file.
+        open_job = None
+        for job_dir in live_job_dirs:
+            manifest = _read_json_file(job_dir / "job.json")
+            if not isinstance(manifest, dict):
+                continue
+            if manifest.get("status", "imported") in (
+                "imported", "running", "partial", "failed", "interrupted",
+                "manual_review",
+            ):
+                open_job = (job_dir, manifest)
+                break
+        # FIX (Sep 2026, "init shouldn't keep duplicating jobs"): re-running
+        # `client_manager.py init` with the SAME workbook imported it as a
+        # brand-new job folder every time, because the only identity check was
+        # the timestamp+digest job_id, and a re-exported workbook has a new
+        # digest. The client then owned several job folders and the upload run
+        # had no principled way to choose -- which is how a stale CSV could win
+        # over the current one.
+        #
+        # A client now has exactly ONE live job folder. A new file is APPENDED
+        # to that job's manifest as an additional source, and the run reads the
+        # whole set. Re-importing a file the job already owns is a NO-OP that
+        # returns the same job, so `init` is genuinely idempotent; a genuinely
+        # new file never creates a second folder.
+        #
+        # A job that is already settled is NOT reopened. Such a client gets a
+        # fresh job for the new file -- the only case that still creates one.
+        def _owned_source_path(job_dir: Path, manifest: dict) -> Optional[Path]:
+            """The already-imported file in this job whose digest we just saw."""
+            for entry in manifest.get("sources") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("sha256") != digest:
+                    continue
+                candidate = job_dir / str(entry.get("filename") or "")
+                if candidate.is_file():
+                    return candidate
+            return None
+
+        if open_job is not None:
+            open_dir, open_manifest = open_job
+            already = _owned_source_path(open_dir, open_manifest)
+            if already is not None:
+                print(
+                    f"[workspace] client {resolved_client_id}: {original_name} "
+                    f"already imported in job {open_dir.name} -- no change",
+                    flush=True,
+                )
+                return self.workspace(resolved_client_id, open_dir.name, already)
+        # The digest is in the workspace but NOT in the open job: it is either
+        # owned by a settled job of THIS client, or by another client entirely.
+        # Both are real conflicts -- silently moving on would upload the same
+        # customers twice -- so both stay hard errors.
         existing_owner = self._find_source_owner(digest)
         if existing_owner is not None:
             existing_client, existing_job = existing_owner
-            raise DuplicateJobError(
-                f"Source already belongs to client {existing_client} "
-                f"as job {existing_job}; refusing cross-client reuse"
-            )
-        for existing in paths.jobs_dir.glob("*/job.json"):
-            try:
-                if json.loads(existing.read_text(encoding="utf-8-sig")).get("source_sha256") == digest:
-                    raise DuplicateJobError(f"Source already imported as {existing.parent.name}")
-            except json.JSONDecodeError:
+            if existing_client != resolved_client_id:
+                raise DuplicateJobError(
+                    f"Source already belongs to client {existing_client} "
+                    f"as job {existing_job}; refusing cross-client reuse"
+                )
+        for job_dir in live_job_dirs:
+            manifest = _read_json_file(job_dir / "job.json")
+            if not isinstance(manifest, dict):
                 continue
+            if digest in _manifest_source_digests(manifest):
+                raise DuplicateJobError(
+                    f"Source already imported as settled job {job_dir.name}"
+                )
+        # FIX (Sep 2026, "init shouldn't keep duplicating jobs"): re-running
+        # `client_manager.py init` with the SAME workbook re-imported it as a
+        # brand-new job folder every time, because the only identity check was
+        # the timestamp+digest job_id, and a re-exported workbook has a new
+        # digest. The client then owned several job folders and the upload run
+        # had no principled way to choose, which is how a stale CSV could win
+        # over the current one.
+        #
+        # A client now has exactly ONE live job folder. A new file is APPENDED
+        # to that job's manifest as an additional source, and the run reads the
+        # whole set. Re-importing an identical file is still refused
+        # (DuplicateJobError), so this is idempotent, and a genuinely new
+        # file never creates a second folder.
+        #
+        # A job that is already finished is NOT reopened: it is settled
+        # history, and its counts/report must stay stable. Such a client gets a
+        # fresh job for the new file, which is the only case that still
+        # creates a folder.
+        open_job = None
+        for job_dir in live_job_dirs:
+            manifest = _read_json_file(job_dir / "job.json")
+            if not isinstance(manifest, dict):
+                continue
+            if manifest.get("status", "imported") in (
+                "imported", "running", "partial", "failed", "interrupted",
+                "manual_review",
+            ):
+                open_job = (job_dir, manifest)
+                break
+        if open_job is not None:
+            job_dir, manifest = open_job
+            job_id = job_dir.name
+            safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+            stem = f"{safe_name}_{resolved_client_id}_{digest[:8]}"
+            destination = _unique_destination(job_dir, stem, source.suffix.lower())
+            shutil.move(str(source), str(destination))
+            sources = [
+                dict(entry) for entry in (manifest.get("sources") or [])
+                if isinstance(entry, dict)
+            ]
+            sources.append({
+                "filename": destination.name,
+                "sha256": digest,
+                "original_name": original_name,
+                "added_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
+            manifest["sources"] = sources
+            manifest.setdefault("source_sha256", sources[0]["sha256"])
+            manifest["source_filename"] = sources[0]["filename"]
+            manifest["updated_at"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            _atomic_json_write(job_dir / "job.json", manifest)
+            print(
+                f"[workspace] client {resolved_client_id}: appended "
+                f"{original_name} to existing job {job_id} "
+                f"({len(sources)} source(s)) -- no new job folder",
+                flush=True,
+            )
+            return self.workspace(resolved_client_id, job_id, destination)
         job_id = f"job_{time.strftime('%Y%m%d_%H%M%S')}_{digest[:8]}"
         job_dir = paths.jobs_dir / job_id
         if job_dir.exists():
@@ -827,13 +1405,36 @@ class WorkspaceManager:
         )
         shutil.move(str(source), str(destination))
         (job_dir / "source.sha256").write_text(digest, encoding="utf-8")
+        # The first file is recorded as a `sources` entry, exactly like every
+        # file appended later. Writing the legacy single-source fields only
+        # would leave the first file invisible to job_source_files(), so the
+        # run would upload the second and third file while silently dropping
+        # the first -- the exact data loss this rewrite exists to prevent.
         _atomic_json_write(job_dir / "job.json", {
             "schema_version": 1, "client_id": resolved_client_id, "name_key": key,
             "job_id": job_id, "source_original_name": original_name,
             "source_sha256": digest, "source_extension": source.suffix.lower(),
+            "source_filename": destination.name,
+            "sources": [{
+                "filename": destination.name,
+                "sha256": digest,
+                "original_name": original_name,
+                "added_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }],
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "status": "imported",
         })
+        # --- one active job per client -------------------------------------
+        # Retire everything older ONLY after the new job is fully
+        # materialised (source moved in + manifest written). Superseding first
+        # would leave the client with zero live jobs if anything in between
+        # raised, and the whole point of this rule is that a client always has
+        # exactly one folder holding the work we are doing right now.
+        for line in self.supersede_other_jobs(
+                resolved_client_id, job_id,
+                f"replaced by {original_name}"):
+            print(f"[workspace] client {resolved_client_id}: {line}", flush=True)
         return self.workspace(resolved_client_id, job_id, destination)
 
     def validate_source_identity(self, filename: str, client_id: Optional[str]) -> None:
@@ -1022,7 +1623,10 @@ class WorkspaceManager:
         # One replaceable run workspace per job prevents empty timestamped
         # directories and unbounded diagnostic/report accumulation.
         run_id = "current"
-        workspace = self._job_paths(client_id, job_id, source, run_id)
+        workspace = self._job_paths(
+            client_id, job_id, source, run_id,
+            source_paths=self.job_source_files(client_id, job_id, source),
+        )
         workspace.run_dir.mkdir(parents=True, exist_ok=True)
         (workspace.job_dir / "locks").mkdir(parents=True, exist_ok=True)
         return workspace
@@ -1075,18 +1679,25 @@ class WorkspaceManager:
             "imported", "running", "partial", "failed", "interrupted",
             "manual_review",
         }
+        # FIX (Sep 2026, one active job per client): sweep the housekeeping
+        # first so the queue this returns can only ever hold one job per
+        # client -- orphan folders that were never jobs get quarantined, and
+        # any client that somehow has two live jobs keeps the newest.
+        for line in self.quarantine_orphan_job_dirs():
+            print(f"[workspace] {line}", flush=True)
+        for line in self.enforce_single_active_job():
+            print(f"[workspace] {line}", flush=True)
         pending = []
-        registry = self._load_registry().get("name_keys", {})
-        client_ids = {
-            client_id
-            for values in registry.values()
-            for client_id in (values if isinstance(values, list) else [values])
-        }
-        for client_id in sorted(client_ids):
+        for client_id in self.known_client_ids():
             paths = self.client_paths(client_id)
             jobs_dir = paths.jobs_dir
             if not jobs_dir.exists():
                 continue
+            live_pending = {
+                job_dir.name
+                for job_dir, manifest in self.live_jobs(client_id)
+                if manifest.get("status", "imported") in pending_statuses
+            }
             search_dirs = [jobs_dir, jobs_dir / "archive" / "completed"]
             for search_dir in search_dirs:
                 if not search_dir.exists():
@@ -1101,6 +1712,40 @@ class WorkspaceManager:
                         raise ValueError(f"Invalid job manifest: {manifest_path}") from exc
                     status = manifest.get("status", "imported")
                     if status in pending_statuses:
+                        # FIX (Sep 2026, archived job with a pending status):
+                        # this branch used to call workspace(client_id,
+                        # job_dir.name) directly, but workspace() resolves
+                        # jobs_dir/<job_id> -- the LIVE path. An archived job
+                        # with status "imported" (Valentine's
+                        # archive/completed/job_20260917_200743_d644f0ce was
+                        # exactly this) therefore raised
+                        #   FileNotFoundError: Unknown job: job_20260917_...
+                        # and killed the whole batch before any client was
+                        # touched. A pending status in the archive is simply
+                        # unfinished work that has not been brought home, so
+                        # restore it to the live jobs directory first and
+                        # address it there. Same rule as the completed-with-
+                        # failures branch below: never resurrect a second
+                        # folder for a client that already has a live job.
+                        if "archive" in job_dir.parts:
+                            if live_pending:
+                                print(
+                                    f"[workspace] client {client_id}: archived "
+                                    f"job {job_dir.name} is still {status} but "
+                                    f"{sorted(live_pending)[0]} is the active "
+                                    f"job -- held in the archive",
+                                    flush=True)
+                                continue
+                            restored_dir = jobs_dir / job_dir.name
+                            if restored_dir.exists():
+                                # A live folder of the same name already won
+                                # the race; the archived copy stays put rather
+                                # than being merged blindly.
+                                continue
+                            shutil.move(str(job_dir), str(restored_dir))
+                            job_dir = restored_dir
+                            live_pending.add(job_dir.name)
+                        live_pending.add(job_dir.name)
                         pending.append(self.workspace(client_id, job_dir.name))
                     elif status == "completed" and self.job_has_pending_uploads(
                             client_id, job_dir.name):
@@ -1112,6 +1757,22 @@ class WorkspaceManager:
                         # to "partial" so the run's completion gate decides
                         # again whether it may be re-archived.
                         if "archive" in job_dir.parts:
+                            # FIX (Sep 2026, one active job per client): an
+                            # archived job may only come back while the client
+                            # has no live job. Otherwise restoring it would
+                            # recreate the two-folders situation this whole
+                            # policy exists to prevent. The leftover orders
+                            # are NOT lost -- they sit in this job's retry
+                            # queue and are restored on the first run after
+                            # the newer job completes.
+                            if live_pending:
+                                print(
+                                    f"[workspace] client {client_id}: archived "
+                                    f"job {job_dir.name} still has un-uploaded "
+                                    f"orders but {sorted(live_pending)[0]} is "
+                                    f"the active job -- held in the archive",
+                                    flush=True)
+                                continue
                             restored_dir = jobs_dir / job_dir.name
                             if restored_dir.exists():
                                 continue
@@ -1119,5 +1780,6 @@ class WorkspaceManager:
                             self.set_job_status(client_id, job_dir.name,
                                                 "partial", pending_failed=True)
                             job_dir = restored_dir
+                            live_pending.add(job_dir.name)
                         pending.append(self.workspace(client_id, job_dir.name))
         return pending

@@ -78,6 +78,14 @@ CATALOG_METADATA_PATH = PROGRESS_DIR / "catalog_metadata.json"
 AUTH_STORAGE_PATH = _SCRIPT_DIR / "session_state.json"
 ACTIVE_WORKSPACE: ClientWorkspace | None = None
 
+# How often a ``--workers`` shard re-checks the shared claim queue while it is
+# idly waiting out the steal delay. This is now only the floor the exact
+# remaining-grace wait falls back to (see _iter_claimed_rows) -- the wait is
+# sized to the steal deadline itself, so this is an anti-busy-spin guard rather
+# than the pacing it used to be. Only reached when a peer is holding the
+# remaining rows, so it costs nothing on the normal path.
+CLAIM_IDLE_POLL_S = 0.02
+
 
 def _configure_workspace(workspace: ClientWorkspace) -> None:
     """Point legacy module-level paths at one immutable client job."""
@@ -99,6 +107,29 @@ def _configure_workspace(workspace: ClientWorkspace) -> None:
     workspace.catalog_dir.mkdir(parents=True, exist_ok=True)
     AUTH_STORAGE_PATH = workspace.auth_dir / "session_state.json"
     workspace.auth_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _seed_shard_auth_storage(workspace: ClientWorkspace,
+                             shard: tuple[int, int]) -> Path:
+    """Return a shard worker's private session-state path.
+
+    Shard 0 keeps owning the canonical client session file so it can refresh
+    it for future runs. Higher-numbered workers get their own subdirectory and
+    are seeded from the canonical file when it exists. This prevents concurrent
+    ``storage_state()`` writes and metadata updates from racing each other
+    while preserving session reuse.
+    """
+    canonical = workspace.auth_dir / "session_state.json"
+    shard_index, shard_count = shard
+    if shard_index == 0:
+        return canonical
+    worker_dir = workspace.auth_dir / "workers" / f"shard{shard_index}of{shard_count}"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    worker_storage = worker_dir / "session_state.json"
+    if not worker_storage.exists() and canonical.exists():
+        import shutil
+        shutil.copy2(canonical, worker_storage)
+    return worker_storage
 
 ORDER_FILE_EXTENSIONS = (".csv", ".xlsx", ".xls")
 
@@ -133,9 +164,17 @@ from apps.sniper.product_upload.failed_ledger import (
 from apps.sniper.product_upload.planning import (
     ExecutionPlan, PlanningError, build_execution_plan,
 )
+from apps.sniper.product_upload import wait_profile
+from apps.sniper.product_upload.closure_diagnostics import (
+    enable_trace_rotation, maybe_rotate_trace_chunk,
+)
 from apps.sniper.client_workspace import (
     WorkspaceManager, ClientWorkspace, JobLock, name_key_from_filename,
+    ARCHIVE_RETENTION_DAYS,
 )
+from apps.sniper.client_scheduler import ClientProcessScheduler, ScheduledJob
+from apps.sniper.conditional_wait import poll_until
+from apps.sniper.work_queue import OrderClaimQueue
 
 # ==============================================================================
 LOGIN_URL = "https://sniper.ng/login"
@@ -361,6 +400,26 @@ def _handle_missing_address(order: dict, row_number: int,
     return True
 
 
+def load_orders_from_all(paths) -> list[dict]:
+    """Load and concatenate the order rows of every source in a job.
+
+    A job accumulates one file per ``client_manager init`` run, so a client
+    that was initialized three times holds three workbooks. They are
+    concatenated in the given order, which is manifest order (oldest import
+    first) -- so a job is always read identically no matter how many files were
+    appended.
+
+    Per-file validation is deliberately preserved: each file is loaded through
+    ``load_orders`` on its own, so a missing required column names the file
+    that is actually missing it instead of failing on some unrelated row of a
+    combined frame.
+    """
+    orders: list[dict] = []
+    for path in paths:
+        orders.extend(load_orders(str(path)))
+    return orders
+
+
 def load_orders(path: str) -> list[dict]:
     if path.lower().endswith((".xlsx", ".xls")):
         df = pd.read_excel(path)
@@ -448,7 +507,19 @@ def _clean_for_report(value) -> str:
 def export_skipped_rows(skipped_rows: list[SkippedRow]) -> Path:
     MANUAL_CHECK_DIR.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame([dataclasses.asdict(row) for row in skipped_rows])
-    df.to_csv(SKIPPED_ROWS_PATH, index=False)
+    # Every --workers child re-reads the same source and derives the same
+    # skipped-row list, so several processes can land here at once. Write to a
+    # per-process temp file and os.replace() it in, so a reader never sees a
+    # half-written CSV from an overlapping write.
+    tmp = SKIPPED_ROWS_PATH.with_name(f".{SKIPPED_ROWS_PATH.name}.{os.getpid()}.tmp")
+    try:
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, SKIPPED_ROWS_PATH)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
     return SKIPPED_ROWS_PATH
 
 
@@ -489,18 +560,38 @@ def _read_catalog_cache() -> Optional[list[str]]:
         return None
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically (temp file + replace).
+
+    Parallel shard workers may all try to refresh the shared catalog cache.
+    A plain ``write_text`` can be observed half-written by a sibling worker
+    (or leave a truncated JSON file behind if the process dies mid-write);
+    ``os.replace`` is atomic on both POSIX and Windows, so readers only ever
+    see the old file or the complete new one.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _write_catalog_cache(products: list[str]) -> None:
     try:
         PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
-        CATALOG_CACHE_PATH.write_text(
+        _atomic_write_text(
+            CATALOG_CACHE_PATH,
             json.dumps({"products": products,
                         "cached_at": datetime.now(timezone.utc).isoformat()}, indent=2),
-            encoding="utf-8",
         )
-        CATALOG_METADATA_PATH.write_text(
+        _atomic_write_text(
+            CATALOG_METADATA_PATH,
             json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(),
                         "product_count": len(products)}, indent=2),
-            encoding="utf-8",
         )
     except Exception as e:
         print(f"[cache] could not write catalog cache (non-fatal, will just re-scrape "
@@ -565,6 +656,74 @@ def _reload_for_recovery(page) -> None:
     page.wait_for_selector(LOGGED_IN_SELECTOR, timeout=40000)
 
 
+def _catalog_cache_mtime() -> float | None:
+    try:
+        return CATALOG_CACHE_PATH.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _should_drop_forced_catalog_refresh(effective_refresh_catalog: bool,
+                                          mtime_before_run: float | None,
+                                          mtime_now: float | None) -> bool:
+    """Pure decision for the --lock restart loop: once this run's own
+    scrape has demonstrably written a newer catalog cache than existed
+    when the run started, a later relaunch (browser crash, laptop sleep,
+    a stray modal close -- anything that lands back at this loop) should
+    stop forcing --refresh-catalog and just reuse that cache, instead of
+    paying for a brand-new scrape (+ up to _CATALOG_REFRESH_LOCK_WAIT_S of
+    lock wait) on every single restart. If the mtime hasn't moved, the
+    refresh this run asked for hasn't actually happened yet (e.g. the
+    previous attempt died before ever reaching catalog load), so the next
+    attempt must still get a real one."""
+    if not effective_refresh_catalog:
+        return False
+    return mtime_now != mtime_before_run
+
+
+_CATALOG_REFRESH_LOCK_WAIT_S = 90.0
+
+
+def _acquire_catalog_refresh_lock(timeout_s: float = _CATALOG_REFRESH_LOCK_WAIT_S):
+    """Best-effort single-flight lock around a live catalog refresh.
+
+    Returns a held :class:`JobLock`, or ``None`` if another live worker held it
+    for longer than ``timeout_s``. In the timeout case the caller still scrapes
+    (a hung sibling must never stall the whole run); atomic cache writes keep
+    the shared file valid even if two workers write at once.
+    """
+    lock_path = PROGRESS_DIR / "catalog_refresh.lock"
+
+    def _try_take():
+        """One non-blocking attempt at the lock: returns the JobLock on
+        success, None if a live sibling still holds it."""
+        lock = JobLock(lock_path)
+        try:
+            lock.__enter__()
+        except RuntimeError:
+            return None
+        return lock
+
+    # DYNAMIC WAIT (was a flat time.sleep(0.1) between attempts). The sibling
+    # releases the lock by unlinking a file, which lands whenever it lands --
+    # the old loop slept a full 100ms before even looking again, so up to
+    # 100ms of pure dead time per attempt, on every worker that lost the
+    # single-flight race. poll_until re-tests on a short backing-off schedule
+    # and returns the instant the file is gone.
+    #
+    # Unchanged: the same timeout_s deadline, the same "scraping without the
+    # shared lock" fallback when it expires, and the same guarantee that a
+    # hung sibling can never stall the run.
+    taken = poll_until(_try_take, timeout_s)
+    if taken is not None:
+        return taken
+    print(f"[cache] catalog refresh lock held for over "
+          f"{timeout_s:.0f}s; scraping without the shared lock so the "
+          f"run keeps moving (atomic writes keep the cache valid).",
+          flush=True)
+    return None
+
+
 def _load_catalog(page, lock_mode: bool, refresh_catalog: bool = False) -> list[str]:
     if not refresh_catalog:
         cached = _read_catalog_cache()
@@ -578,27 +737,57 @@ def _load_catalog(page, lock_mode: bool, refresh_catalog: bool = False) -> list[
         print("[cache] --refresh-catalog passed -- ignoring any existing catalog "
               "cache and re-scraping from the live wizard.", flush=True)
 
-    if not lock_mode:
-        catalog = scrape_crm_catalog(page)
-        if catalog:
-            _write_catalog_cache(catalog)
-        return catalog
+    # Single-flight: when several --workers shard processes start together on a
+    # cold/stale cache they all reach this point at once. One worker scrapes
+    # while the rest wait on the shared lock and then reuse the fresh cache
+    # instead of each opening the wizard. The lock is released by __exit__ even
+    # if scraping raises, so a crash cannot wedge the next run.
+    cache_mtime_before = _catalog_cache_mtime()
+    catalog_lock = _acquire_catalog_refresh_lock()
+    try:
+        if refresh_catalog:
+            # A sibling may have finished the refresh while we waited. Compare
+            # mtimes so we only reuse a genuinely newer file; if the cache was
+            # not touched we still own the duty to refresh it.
+            if _catalog_cache_mtime() != cache_mtime_before:
+                cached = _read_catalog_cache()
+                if cached is not None:
+                    print(f"[cache] another worker refreshed the catalog while this "
+                          f"worker waited -- reusing {len(cached)} product(s).",
+                          flush=True)
+                    return cached
+        else:
+            cached = _read_catalog_cache()
+            if cached is not None:
+                print(f"[cache] another worker populated the catalog cache while "
+                      f"this worker waited -- reusing {len(cached)} product(s).",
+                      flush=True)
+                return cached
 
-    failures = 0
-    while True:
-        catalog = scrape_crm_catalog(page)
-        if catalog:
-            _write_catalog_cache(catalog)
+        if not lock_mode:
+            catalog = scrape_crm_catalog(page)
+            if catalog:
+                _write_catalog_cache(catalog)
             return catalog
-        failures += 1
-        print(f"[lock] catalog attempt {failures}/3 failed; retrying immediately.",
-              flush=True)
-        if failures < 3:
-            continue
-        print("[lock] catalog failed 3 consecutive times; reloading the page.",
-              flush=True)
-        _reload_for_recovery(page)
+
         failures = 0
+        while True:
+            catalog = scrape_crm_catalog(page)
+            if catalog:
+                _write_catalog_cache(catalog)
+                return catalog
+            failures += 1
+            print(f"[lock] catalog attempt {failures}/3 failed; retrying immediately.",
+                  flush=True)
+            if failures < 3:
+                continue
+            print("[lock] catalog failed 3 consecutive times; reloading the page.",
+                  flush=True)
+            _reload_for_recovery(page)
+            failures = 0
+    finally:
+        if catalog_lock is not None:
+            catalog_lock.__exit__(None, None, None)
 
 
 def export_manual_check(failed_rows: list[FailedOrder]) -> Path:
@@ -615,19 +804,68 @@ def export_fuzzy_review(flagged_rows: list[FlaggedForReview]) -> Path:
     return FUZZY_REVIEW_PATH
 
 
+def _percentile(values: list[float], pct: float) -> float:
+    """p-th percentile. Uses the same 'inclusive' method as the previous
+    total-only summary so the headline number does not jump just because
+    the report got more detail."""
+    if not values:
+        return 0.0
+    if len(values) < 20:
+        return max(values)
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round(pct / 100.0 * (len(ordered) - 1)))))
+    return ordered[idx]
+
+
+# PERF (Phase 0): the coarse phases that tile every order. The "<phase>.*"
+# sub-keys are reported separately and are NOT part of the total, because
+# they are nested INSIDE these three (summing both would double-count).
+_COARSE_PHASES = ("product_lines_ms", "charges_and_customer_ms", "submit_ms")
+
+
 def print_performance_summary(counters: dict) -> None:
+    """Phase 0 report: per-phase p50/p95 (not just a total average) plus the
+    wait_profile verdict, so a real run answers "where does the time go" and
+    "are waits actually the bottleneck" with numbers instead of guesses."""
     samples = counters.get("timings_ms", [])
-    if not samples:
-        return
-    totals = [sum(t.values()) for t in samples]
-    p95 = max(totals) if len(totals) < 20 else statistics.quantiles(
-        totals, n=20, method="inclusive"
-    )[18]
-    print(
-        "[metrics] browser phases ms: "
-        f"orders={len(totals)} avg={statistics.mean(totals):.1f} "
-        f"p50={statistics.median(totals):.1f} p95={p95:.1f}"
-    )
+    total_order_ms = 0.0
+    if samples:
+        totals = [float(t.get("total_ms", 0.0)) for t in samples]
+        total_order_ms = sum(totals)
+        p95 = _percentile(totals, 95)
+        print(
+            "[metrics] browser phases ms: "
+            f"orders={len(totals)} avg={statistics.mean(totals):.1f} "
+            f"p50={statistics.median(totals):.1f} p95={p95:.1f}"
+        )
+        # Per-phase breakdown, so a slow phase is visible rather than
+        # averaged away inside the single total.
+        for phase in _COARSE_PHASES:
+            vals = [float(t.get(phase, 0.0)) for t in samples if phase in t]
+            if not vals:
+                continue
+            share = (statistics.mean(vals) / statistics.mean(totals) * 100.0) \
+                if totals and statistics.mean(totals) else 0.0
+            print(f"[metrics]   {phase:<26} avg={statistics.mean(vals):8.1f} "
+                  f"p50={statistics.median(vals):8.1f} p95={_percentile(vals, 95):8.1f}"
+                  f"  ({share:4.1f}% of order)")
+        # Sub-steps (nested inside the coarse phases -- reported for ranking,
+        # never summed into the total).
+        subs: dict[str, list[float]] = {}
+        for t in samples:
+            for k, v in t.items():
+                if k not in _COARSE_PHASES and k != "total_ms":
+                    subs.setdefault(k, []).append(float(v))
+        if subs:
+            ranked = sorted(subs.items(), key=lambda kv: -statistics.mean(kv[1]))
+            print("[metrics] sub-steps (nested in the phases above, not additive):")
+            for name, vals in ranked:
+                print(f"[metrics]   {name:<26} avg={statistics.mean(vals):8.1f} "
+                      f"p50={statistics.median(vals):8.1f} p95={_percentile(vals, 95):8.1f}"
+                      f"  n={len(vals)}")
+
+    for line in wait_profile.render_lines(total_order_ms):
+        print(line)
 
 
 def _match_fresh_order(
@@ -719,6 +957,11 @@ def _attempt_order(page, cfg, order: dict, row_number, progress: ProgressTracker
                     flagged_rows: list[FlaggedForReview],
                     plan: ExecutionPlan | None = None,
                     lock_mode: bool = False) -> bool:
+    # PERF/DIAGNOSTICS (Sep 2026): keep a long --enable-diagnostics run's
+    # trace bounded. A no-op on a normal run -- the rotator is only armed when
+    # tracing actually started -- so this costs one dict lookup per order.
+    maybe_rotate_trace_chunk(page, cfg, row_number)
+
     if progress.is_done(order) or job_progress.is_done(order):
         counters["skipped_duplicate"] = counters.get("skipped_duplicate", 0) + 1
         retry_cache.remove(order)
@@ -824,7 +1067,7 @@ def _attempt_order(page, cfg, order: dict, row_number, progress: ProgressTracker
                 state="attached", timeout=1500
             )
         except Exception:
-            safe_goto(page, TARGET_URL, wait_until="commit")
+            safe_goto(page, TARGET_URL, wait_until="commit", settle_ms=0)
             page.wait_for_selector(LOGGED_IN_SELECTOR, timeout=20000)
     return result.success
 
@@ -1052,12 +1295,166 @@ def _stop_diagnostics_tracing(context, tracing_active: bool) -> None:
         pass
 
 
+def _dedupe_orders(orders: list[dict]) -> tuple[list[dict], int]:
+    """Drop rows that hash to an order_key() already seen in this file.
+
+    PERF (--workers): parallel workers would otherwise both pass the
+    is_done() check before either marks an order done and submit it twice
+    (serial mode never had that race). Every worker applies this same
+    deterministic filter, so all workers -- and the parent -- agree on row
+    indices as well as on which rows exist. Rows whose key can't be computed
+    are always kept (they can't collide with anything).
+
+    Returns ``(unique_orders, dropped_count)``.
+    """
+    seen_keys: set[str] = set()
+    unique_orders: list[dict] = []
+    duplicates = 0
+    for order in orders:
+        try:
+            key = order_key(order)
+        except Exception:
+            unique_orders.append(order)
+            continue
+        if key in seen_keys:
+            duplicates += 1
+            continue
+        seen_keys.add(key)
+        unique_orders.append(order)
+    return unique_orders, duplicates
+
+
+def _iter_claimed_rows(todo: list[tuple[int, dict]], orders: list[dict],
+                       claim_queue: Optional[OrderClaimQueue]):
+    """Yield ``(row_number, order)`` pairs for one worker to process.
+
+    Without a claim queue this just replays ``todo`` in file order -- the
+    single-session behaviour, untouched.
+
+    With one (``--workers``), rows are pulled one at a time from a shared
+    cursor over the WHOLE file instead of a per-worker slice, so a worker
+    whose rows happen to finish early keeps taking work instead of idling
+    while a slower peer still has rows left.
+
+    Positions are claimed over the full ``orders`` list rather than over each
+    worker's own remaining-work list on purpose: every worker's view of the
+    progress DB drifts as the run proceeds (rows are marked done
+    continuously), so a filtered list would map position -> row differently
+    in each worker and two workers could claim what is, for them, the same
+    row. Claiming full-file positions makes position -> row identical
+    everywhere. Rows already marked done are simply skipped here: they cost
+    their one claim and nothing else (no planning, no browser work).
+
+    An exception in the caller's loop body leaves the current row "in
+    flight" rather than completed, so the *same* worker re-offers it first
+    when ``--lock`` restarts the session in this process.
+
+    ``claim_next`` returns ``None`` for two different reasons -- the file is
+    genuinely exhausted, or this worker's own band is spent and it is still
+    inside the steal delay -- so the loop only stops once *nothing* is
+    unclaimed. While rows are merely waiting to be stolen it sleeps briefly and
+    asks again, which is what lets an early worker absorb a dead peer's work
+    instead of exiting and leaving those rows for the next run.
+    """
+    if claim_queue is None:
+        yield from todo
+        return
+    todo_rows = {row_number for row_number, _ in todo}
+    if not todo_rows:
+        # Nothing to do: do not burn one claim per already-done file row.
+        return
+    # Tracked as 0-based *positions* because that is what the claim queue counts
+    # in: ``claim_next`` hands out positions, and ``unclaimed_in`` inspects the
+    # ``row-<position>.claim`` sentinels. Keeping these in row numbers instead
+    # would be an off-by-one that leaves the exit check permanently unsatisfied
+    # and spins the worker forever.
+    remaining = {row_number - 1 for row_number in todo_rows}
+    while True:
+        position = claim_queue.claim_next(len(orders))
+        if position is None:
+            if not claim_queue.unclaimed_in(remaining):
+                return
+            # Rows are still unclaimed: a peer is holding its band, or died
+            # holding one. Wait for the steal delay to clear, then re-ask.
+            #
+            # DYNAMIC WAIT (was a flat time.sleep(CLAIM_IDLE_POLL_S), i.e.
+            # 1.0s). The steal delay is wall-clock, so the condition
+            # ("steal_grace_s has elapsed") becomes true at a point we can
+            # predict -- a flat 1s tick either overshoots that point by up to
+            # a full second or, on a short grace, wakes up repeatedly for
+            # seconds while the delay is plainly still running. Sleeping
+            # exactly the remaining grace and re-asking once makes the tail
+            # latency after a dead peer's band opens up precise instead of
+            # rounded to whole seconds.
+            #
+            # Deliberately NOT poll_until here: unlike the lock above there
+            # is no file to watch, and the release moment is known in advance
+            # from the queue's own clock, so an exact sleep is both cheaper
+            # and more precise than re-polling. The 20ms floor keeps
+            # sub-millisecond remainders from becoming a busy-spin.
+            remaining_s = claim_queue.seconds_until_stealable()
+            if remaining_s > 0:
+                time.sleep(max(remaining_s, CLAIM_IDLE_POLL_S))
+            continue
+        if position in remaining:
+            yield position + 1, orders[position]
+            remaining.discard(position)
+        claim_queue.mark_complete(position)
+
+
+def _plan_row(order: dict, row_number: int, catalog: list[str],
+              missing_address_counts: dict[str, int]):
+    """Plan one row locally (product match + state inference + address rules).
+
+    Returns ``(plan, failure, missing_address)``: ``plan`` is None when the
+    row cannot be attempted at all, in which case ``failure`` holds the
+    message to log it with and ``missing_address`` says whether the cause was
+    a first-sighting blank address cell (logged as failed WITHOUT ever
+    opening the browser). Healthy rows are logged as one instant
+    ``[address]`` line and returned as a plan.
+    """
+    raw_address = order.get("address", "")
+    used_lagos_default = False
+    if not isinstance(raw_address, str) or not raw_address.strip():
+        if _handle_missing_address(order, row_number, missing_address_counts):
+            # First sighting: flagged for a human, not uploaded.
+            return None, (
+                f"no address in the source file for "
+                f"{order.get('customer_name')!r} (Filtered # "
+                f"{order.get('filtered_sn') or 'n/a'}) -- fix the "
+                f"Address cell and run again"
+            ), True
+        # Second sighting: counter reset -- proceed automatically with the
+        # 'Lagos' default (no parameter passed anywhere; the default lives
+        # right here).
+        order = {**order, "address": "Lagos"}
+        used_lagos_default = True
+    try:
+        plan = build_execution_plan(order, catalog)
+    except PlanningError as exc:
+        return None, str(exc), False
+    if used_lagos_default:
+        plan = dataclasses.replace(plan, used_state_fallback=True)
+    # One instant local line per healthy row: address intact -> resolved
+    # state (or 'skipped'), then move on.
+    sn = order.get("filtered_sn")
+    where = f", Filtered # {sn}" if sn else ""
+    label = (plan.state if plan.state is not None
+             else "no state inferable -- state field will be skipped")
+    print(f"[address] row {row_number}{where} "
+          f"({order.get('customer_name')!r}): "
+          f"{str(order.get('address', ''))[:60]!r} -> {label}",
+          flush=True)
+    return plan, None, False
+
+
 def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                   job_progress: ProgressTracker,
                   retry_cache: RetryCache, failed_ledger: FailedLedger,
                   failure_log: FailureLogger, counters: dict,
                   failed_rows: list[FailedOrder], flagged_rows: list[FlaggedForReview],
-                  refresh_catalog: bool = False, enable_tracing: bool = True) -> None:
+                  refresh_catalog: bool = False, enable_tracing: bool = False,
+                  claim_queue: Optional[OrderClaimQueue] = None) -> None:
     """One full attempt at a browser session: launch, log in, load the
     catalog, walk every order. Raises on anything it can't recover from
     locally (a real browser/network failure, an unhandled Playwright
@@ -1081,6 +1478,15 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
     pending is exactly where the retry queue left it. Blank-address
     sighting counts are file-backed too (missing_address_counts.json),
     so the first-run flag / second-run 'Lagos' cycle survives restarts.
+
+    ``claim_queue`` (``--workers`` only): when given, this session does not
+    walk a pre-assigned slice of ``orders``. It claims rows one at a time
+    from the shared queue, plans each one on the spot (planning is local but
+    can include an address lookup, so it is never repeated across workers),
+    uploads it, then claims again. A worker that finishes early therefore
+    keeps taking work instead of idling behind a slow peer, and a ``--lock``
+    session restart resumes the exact row it was in the middle of. Without a
+    claim queue the session walks ``orders`` in file order exactly as before.
     """
     with sync_playwright() as p:
         # PERF: keep in-page timers (fast_waits' wait_for_function
@@ -1134,11 +1540,18 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
             # FIX (Sep 2026): start closure-diagnostics tracing right after
             # login, once, for the whole run -- see _start_diagnostics_tracing.
             tracing_active = _start_diagnostics_tracing(context) if enable_tracing else False
-            if not enable_tracing:
-                print("[speed] --no-diagnostics passed -- Playwright tracing not "
-                      "started this run. Closure screenshots/.txt/.json still get "
-                      "written if anything closes unexpectedly; only the extra "
-                      "saved .zip trace is skipped.", flush=True)
+            if enable_tracing:
+                print("[speed] diagnostics: ON -- Playwright tracing (a DOM "
+                      "snapshot + screenshot per action) is recording for this "
+                      "whole run and waits are being timed, so expect this run to "
+                      "be slower than normal. Trace windows rotate, so memory "
+                      "stays bounded even on a long run.", flush=True)
+            else:
+                print("[speed] diagnostics: OFF (fast mode) -- pass "
+                      "--enable-diagnostics to record Playwright traces + wait "
+                      "timings for a run you need to debug. Closure "
+                      "screenshots/.txt/.json evidence is written either way.",
+                      flush=True)
 
             page.wait_for_selector(LOGGED_IN_SELECTOR, timeout=40000)
             catalog = _load_catalog(page, lock_mode, refresh_catalog=refresh_catalog)
@@ -1155,6 +1568,11 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                 diagnostics_dir=str(ACTIVE_WORKSPACE.diagnostics_dir)
                 if ACTIVE_WORKSPACE else "recordings/closure_diagnostics",
             )
+            if tracing_active:
+                # DIAGNOSTICS (Sep 2026): arm trace-window rotation so a long
+                # --enable-diagnostics run cannot buffer its whole trace in
+                # RAM -- see closure_diagnostics.maybe_rotate_trace_chunk.
+                enable_trace_rotation(cfg.diagnostics_dir)
 
             plans: dict[int, ExecutionPlan] = {}
             deterministic_failures: dict[int, str] = {}
@@ -1197,43 +1615,23 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
             from apps.sniper.product_upload import state_engine as _state_engine
             _state_engine.clear_memo()
             missing_address_counts = _load_missing_address_counts()
-            for row_number, order in todo:
-                raw_address = order.get("address", "")
-                used_lagos_default = False
-                if not isinstance(raw_address, str) or not raw_address.strip():
-                    if _handle_missing_address(order, row_number,
-                                               missing_address_counts):
-                        # First sighting: flagged for a human, not uploaded.
-                        missing_address_rows.add(row_number)
-                        deterministic_failures[row_number] = (
-                            f"no address in the source file for "
-                            f"{order.get('customer_name')!r} (Filtered # "
-                            f"{order.get('filtered_sn') or 'n/a'}) -- fix the "
-                            f"Address cell and run again")
-                        continue
-                    # Second sighting: counter reset -- proceed automatically
-                    # with the 'Lagos' default (no parameter passed anywhere;
-                    # the default lives right here).
-                    order = {**order, "address": "Lagos"}
-                    used_lagos_default = True
-                try:
-                    plan = build_execution_plan(order, catalog)
-                except PlanningError as exc:
-                    deterministic_failures[row_number] = str(exc)
-                    continue
-                if used_lagos_default:
-                    plan = dataclasses.replace(plan, used_state_fallback=True)
-                plans[row_number] = plan
-                # One instant local line per healthy row: address intact ->
-                # resolved state (or 'skipped'), then move on.
-                sn = order.get("filtered_sn")
-                where = f", Filtered # {sn}" if sn else ""
-                label = (plan.state if plan.state is not None
-                         else "no state inferable -- state field will be skipped")
-                print(f"[address] row {row_number}{where} "
-                      f"({order.get('customer_name')!r}): "
-                      f"{str(order.get('address', ''))[:60]!r} -> {label}",
-                      flush=True)
+
+            def record_plan(row_number: int, order: dict) -> None:
+                """Plan one row and record the outcome in the run-wide maps."""
+                plan, failure, missing_address = _plan_row(
+                    order, row_number, catalog, missing_address_counts)
+                if plan is not None:
+                    plans[row_number] = plan
+                    return
+                deterministic_failures[row_number] = failure
+                if missing_address:
+                    missing_address_rows.add(row_number)
+
+            if claim_queue is None:
+                # Serial session: every row is known up front, so plan them
+                # once before the (drain-first) upload loop, exactly as before.
+                for row_number, order in todo:
+                    record_plan(row_number, order)
 
             # FIX (Sep 2026, "try all failed uploads FIRST on every fresh
             # run"): the failed-orders ledger drains before anything else --
@@ -1266,7 +1664,11 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
             # work that finished in a previous run. Row numbers (i) are the
             # original 1-based positions, so all logging still lines up with
             # the Excel sheet.
-            for i, order in todo:
+            for i, order in _iter_claimed_rows(todo, orders, claim_queue):
+                if claim_queue is not None:
+                    # --workers: a worker only learns which row it owns at
+                    # claim time, so plan it here, once, just before use.
+                    record_plan(i, order)
                 print(f"[{i}/{len(orders)}] Processing {order.get('customer_name')!r}...", flush=True)
 
                 if i in deterministic_failures:
@@ -1327,11 +1729,12 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
 def _run_sharded(workspace: "ClientWorkspace", workers: int, lock_mode: bool,
                   refresh_catalog: bool, enable_tracing: bool) -> None:
     """PERF (--workers N): split one client job across N independent
-    browser processes, each owning a disjoint, round-robin slice of the
-    order rows (row i -> shard i % N). The CRM is a hosted SPA, so the
-    per-order wall time is dominated by network round trips; N workers
-    overlap those waits and finish a big file in roughly 1/N the time
-    without changing ANY per-order logic.
+    browser processes. Children do not own a fixed slice: they pull the next
+    unclaimed row from a shared claim queue as they finish each one, so a
+    worker whose rows happen to be fast keeps taking work instead of idling
+    behind a slow peer. The CRM is a hosted SPA, so the per-order wall time is
+    dominated by network round trips; N workers overlap those waits and finish
+    a big file in roughly 1/N the time without changing ANY per-order logic.
 
     Persistence guarantees are preserved exactly:
       - progress DBs are SQLite (WAL) -- concurrent mark_done() from N
@@ -1343,32 +1746,32 @@ def _run_sharded(workspace: "ClientWorkspace", workers: int, lock_mode: bool,
         file back into the main queue when the workers exit. A crash
         between partition and merge is recovered on the next run by
         collect_and_merge_shard_queues() (called from _run_upload).
-      - duplicate fingerprints are dropped up front: parallel workers
-        would otherwise both pass the is_done() check before either
-        marks the order done and submit it twice (serial mode never had
-        this race).
+      - duplicate fingerprints are dropped by the parent AND by every child
+        before claiming starts: parallel workers would otherwise both pass
+        the is_done() check before either marks the order done and submit it
+        twice (serial mode never had this race).
+      - one shared claim queue hands each row to exactly one worker; a row
+        whose worker process dies is left un-marked-done and reprocessed on
+        the next run, whose reset() clears every stale claim.
       - this parent holds the job + auth locks for the whole duration;
         shard children (--shard) skip locking entirely.
     """
     _configure_workspace(workspace)
-    orders = load_orders(str(workspace.source_path))
-    seen_keys: set[str] = set()
-    unique_orders: list[dict] = []
-    duplicates = 0
-    for order in orders:
-        try:
-            key = order_key(order)
-        except Exception:
-            unique_orders.append(order)
-            continue
-        if key in seen_keys:
-            duplicates += 1
-            continue
-        seen_keys.add(key)
-        unique_orders.append(order)
+    source_files = tuple(workspace.source_paths) or (workspace.source_path,)
+    unique_orders, duplicates = _dedupe_orders(load_orders_from_all(source_files))
     if duplicates:
         print(f"[shard] dropped {duplicates} duplicate row(s) that parallel "
-              f"workers would otherwise submit twice.", flush=True)
+              f"workers would otherwise submit twice "
+              f"({len(unique_orders)} unique row(s) remain).", flush=True)
+
+    # A shared claim queue replaces the old fixed slice: children pull the next
+    # unclaimed row as they finish, so a worker whose rows happen to be fast
+    # keeps taking work instead of idling behind a slow peer. Reset it now so a
+    # crashed previous run's leftover sentinels can never shadow this run.
+    OrderClaimQueue(PROGRESS_DIR / "shard_claims").reset()
+    print(f"[shard] sharing {len(unique_orders)} row(s) through one claim queue "
+          f"across {workers} worker(s) -- each row goes to whichever worker is "
+          f"free next.", flush=True)
 
     partition_queue_into_shards(PROGRESS_DIR,
                                 PROGRESS_DIR / "retry_queue.json", workers)
@@ -1387,8 +1790,8 @@ def _run_sharded(workspace: "ClientWorkspace", workers: int, lock_mode: bool,
             command.append("--lock")
         if refresh_catalog:
             command.append("--refresh-catalog")
-        if not enable_tracing:
-            command.append("--no-diagnostics")
+        if enable_tracing:
+            command.append("--enable-diagnostics")
         print(f"[shard] launching worker {i + 1}/{workers} in a separate "
               f"browser process", flush=True)
         processes.append(subprocess.Popen(command))
@@ -1425,10 +1828,11 @@ def _run_sharded(workspace: "ClientWorkspace", workers: int, lock_mode: bool,
 
 
 def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
-         enable_tracing: bool = True, client: str | None = None,
+         enable_tracing: bool = False, client: str | None = None,
          source: str | None = None, job: str | None = None,
          dry_run: bool = False, skip_done: bool = True,
          workers: int = 1, shard: tuple[int, int] | None = None) -> None:
+    global AUTH_STORAGE_PATH
     if client:
         manager = WorkspaceManager()
         if job:
@@ -1446,21 +1850,53 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
             shutil.copy2(input_path, inbox_copy)
             workspace = manager.import_inbox(inbox_copy, client_id=client)
         _configure_workspace(workspace)
+        if shard is not None:
+            AUTH_STORAGE_PATH = _seed_shard_auth_storage(workspace, shard)
         print(f"Client: {workspace.client_id}  Job: {workspace.job_id}")
-        print(f"Immutable source: {workspace.source_path}")
-        orders_path = workspace.source_path
+        # A job holds every file appended by earlier init runs, so the whole
+        # set is the work, not just the newest workbook. Reading only
+        # source_path silently dropped every previously imported order.
+        source_files = tuple(workspace.source_paths) or (workspace.source_path,)
+        for _i, _p in enumerate(source_files, start=1):
+            if len(source_files) == 1:
+                print(f"Immutable source: {_p}")
+            else:
+                print(f"Immutable source {_i}/{len(source_files)}: {_p}")
+        orders = load_orders_from_all(source_files)
+        print(f"Loaded {len(orders)} order(s) from "
+              f"{len(source_files)} file(s)")
     else:
         # Legacy single-client layout remains fully supported.
         orders_path = Path(source) if source else find_orders_file()
-    orders = load_orders(str(orders_path))
-    print(f"Loaded {len(orders)} order(s) from {orders_path}")
+        orders = load_orders(str(orders_path))
+        print(f"Loaded {len(orders)} order(s) from {orders_path}")
 
+    print(f"[run] diagnostics={'on' if enable_tracing else 'off'}  "
+          f"--workers={workers}  "
+          + (f"shard {shard[0] + 1}/{shard[1]}" if shard else "single session"),
+          flush=True)
+    if workers > 1 and shard is None:
+        print("[run] --workers > 1: this job is split across that many separate "
+              "browser processes and each row goes to whichever worker is free "
+              "next, so total time drops without changing any per-order logic.",
+              flush=True)
+
+    claim_queue: Optional[OrderClaimQueue] = None
     if shard is not None:
         shard_index, shard_count = shard
         before = len(orders)
-        orders = orders[shard_index::shard_count]
-        print(f"[shard] worker {shard_index + 1}/{shard_count}: processing "
-              f"{len(orders)} of {before} order(s) (round-robin slice).")
+        # Same deterministic dedupe the parent applies, so every child agrees
+        # on which rows exist and on their indices before claiming begins.
+        orders, duplicates = _dedupe_orders(orders)
+        if duplicates:
+            print(f"[shard] worker {shard_index + 1}/{shard_count}: ignored "
+                  f"{duplicates} duplicate row(s) that two workers could both "
+                  f"have submitted.")
+        claim_queue = OrderClaimQueue(PROGRESS_DIR / "shard_claims", shard=shard)
+        print(f"[shard] worker {shard_index + 1}/{shard_count}: pulling rows "
+              f"from the shared claim queue ({len(orders)} of {before} row(s) "
+              f"after dedupe; reserved band {shard_index % shard_count} of "
+              f"{shard_count}).")
 
     if dry_run:
         print(f"Dry run: validated {len(orders)} order(s); no browser or uploads started.")
@@ -1531,6 +1967,12 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
         session_name=session_name,
     )
 
+    # PERF (Phase 0): the wait profile is per-process, so a --lock session
+    # that relaunches the browser keeps accumulating into the same counters.
+    # That is intentional (it reflects the WHOLE run), but the very first
+    # run of the process must start clean.
+    wait_profile.reset()
+
     # These accumulate across every internal session restart in --lock
     # mode, not just the last one -- so the final summary below reflects
     # the WHOLE run, however many times the browser session itself had
@@ -1557,13 +1999,32 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
         # scratch. KeyboardInterrupt (Ctrl+C) is the one thing NOT caught
         # by `except Exception`, so it is the only way to stop this loop.
         attempt = 0
+        # FIX (speed/persistence pass, "interrupted by sleep or modal close
+        # takes long to respond again"): --refresh-catalog previously stayed
+        # True across every internal relaunch of this loop, so a browser
+        # crash, a laptop sleep, or a stray modal close -- ANY exception that
+        # sends control back here -- paid for a brand-new live catalog
+        # scrape plus up to _CATALOG_REFRESH_LOCK_WAIT_S (90s) waiting on the
+        # shared refresh lock, every single time, even seconds after the
+        # previous attempt already wrote a fresh cache. --refresh-catalog
+        # means "refresh once for this run", not "refresh again on every
+        # relaunch this run" -- once THIS run's own scrape has demonstrably
+        # written a newer cache file than existed when the run started,
+        # later relaunches reuse it like any other --lock restart would.
+        # If an attempt fails before ever reaching the catalog load (e.g. a
+        # login failure), the cache mtime is unchanged and the next attempt
+        # still gets a real refresh -- this never skips a refresh that
+        # hasn't actually happened yet.
+        catalog_mtime_before_run = _catalog_cache_mtime()
+        effective_refresh_catalog = refresh_catalog
         while True:
             attempt += 1
             try:
                 _run_session(lock_mode, orders, progress, job_progress, retry_cache,
                              failed_ledger, failure_log,
-                             counters, failed_rows, flagged_rows, refresh_catalog=refresh_catalog,
-                             enable_tracing=enable_tracing)
+                             counters, failed_rows, flagged_rows,
+                             refresh_catalog=effective_refresh_catalog,
+                             enable_tracing=enable_tracing, claim_queue=claim_queue)
                 break
             except KeyboardInterrupt:
                 raise
@@ -1579,12 +2040,17 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
                       f"skipped, queued ones pick up where they left off). Press Ctrl+C "
                       f"to stop.", flush=True)
                 continue
+            finally:
+                if _should_drop_forced_catalog_refresh(
+                        effective_refresh_catalog, catalog_mtime_before_run,
+                        _catalog_cache_mtime()):
+                    effective_refresh_catalog = False
     else:
         try:
             _run_session(lock_mode, orders, progress, job_progress, retry_cache,
                          failed_ledger, failure_log,
                          counters, failed_rows, flagged_rows, refresh_catalog=refresh_catalog,
-                         enable_tracing=enable_tracing)
+                         enable_tracing=enable_tracing, claim_queue=claim_queue)
         except MissingCredentialsError as e:
             print(f"ERROR: {e}")
             sys.exit(1)
@@ -1654,18 +2120,77 @@ def _json_entry_count(path) -> int:
     return 0
 
 
+def workspace_housekeeping(manager: WorkspaceManager,
+                           retention_days: int = ARCHIVE_RETENTION_DAYS) -> None:
+    """Bring every client workspace back to the one-active-job shape.
+
+    Runs before anything decides what work exists, and never opens a browser:
+      1. archive moves a previous completion deferred (locked file) are
+         finished;
+      2. `job_*` folders that never got a manifest are quarantined -- they
+         were the "Michael has three folders and no idea which is real" case;
+      3. any client holding more than one live job keeps only the newest, the
+         rest go to jobs/archive/superseded/ with their state intact;
+      4. archived jobs that have been settled for `retention_days` and hold no
+         un-uploaded orders are moved out to clients/_graveyard/ so the client
+         directory stays readable -- a move, never a delete.
+    """
+    deferred = manager.retry_deferred_archives()
+    if deferred:
+        print(f"[housekeeping] finished {deferred} deferred archive move(s).",
+              flush=True)
+    for line in manager.quarantine_orphan_job_dirs():
+        print(f"[housekeeping] {line}", flush=True)
+    for line in manager.enforce_single_active_job():
+        print(f"[housekeeping] {line}", flush=True)
+    for line in manager.prune_job_archives(retention_days):
+        print(f"[housekeeping] {line}", flush=True)
+
+
+def _fair_share_workers(max_parallel: int, distinct_groups: int) -> int:
+    """PERF (batch concurrency, "one client should get the whole budget,
+    two should split it"): --max-parallel is a proven-safe TOTAL ceiling on
+    concurrent browser sessions (the operator's own tested limit -- see
+    ClientProcessScheduler's docstring on why it exists at all: shared
+    per-client auth/catalog locks, not a CPU guess). Today that ceiling is
+    handed out as a flat --workers-per-job number decided before any job's
+    contention is known, so a solo client run leaves slots idle instead of
+    using them.
+
+    This has NO opinion on whether more than --max-parallel concurrent
+    sessions would be safe -- it never returns anything that could push
+    total concurrent slots past max_parallel, because ClientProcessScheduler
+    still independently enforces that ceiling via its own _fits() check
+    regardless of what this returns. All this does is stop wasting an
+    already-proven-safe budget on a client that's currently the only one
+    asking for it.
+
+    max_parallel <= 0 means "unlimited" (see ClientProcessScheduler.unlimited)
+    -- there is no fixed budget to divide, so callers should not use this and
+    should fall back to the operator's own --workers value instead.
+    """
+    if max_parallel <= 0:
+        return 1
+    groups = max(1, distinct_groups)
+    return max(1, max_parallel // groups)
+
+
 def main(lock_mode: bool = False, refresh_catalog: bool = False,
-         enable_tracing: bool = True, client: str | None = None,
+         enable_tracing: bool = False, client: str | None = None,
          source: str | None = None, job: str | None = None,
          dry_run: bool = False, skip_done: bool = True,
          legacy: bool = False,
          skip: tuple[str, ...] = (),
-         workers: int = 1, shard: tuple[int, int] | None = None) -> None:
-    """Run one explicit job or drain the inbox sequentially.
+         workers: int = 1, shard: tuple[int, int] | None = None,
+         max_parallel: int = 2, auto_scale_workers: bool = False,
+         housekeeping_only: bool = False) -> None:
+    """Run one explicit job or drain the inbox with bounded client concurrency.
 
     The upload engine is intentionally invoked once per workspace. A completed
     workspace returns normally and its browser is closed before the next one
-    starts, so one bad client cannot mix state with another client.
+    starts, so one bad client cannot mix state with another client. In batch
+    mode, ``max_parallel`` caps the total browser slots used by concurrently
+    running client jobs; each child job with ``--workers N`` consumes N slots.
     """
     manager = WorkspaceManager()
 
@@ -1673,8 +2198,8 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
                           shard: tuple[int, int] | None = None) -> None:
         if shard is not None:
             # Shard worker child: the parent owns the job/auth locks and
-            # the final job-status transition -- just run this shard's
-            # slice, then exit. No locks, no status writes, no cleanup.
+            # the final job-status transition -- just claim and upload
+            # rows, then exit. No locks, no status writes, no cleanup.
             _run_upload(lock_mode, refresh_catalog, enable_tracing,
                         workspace.client_id, None, workspace.job_id,
                         dry_run, skip_done, shard=shard)
@@ -1839,6 +2364,21 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
 
     skip_values = {item.lower() for item in skip}
     manager.recover_claimed_files()
+    # FIX (Sep 2026, "every client has exactly one job folder"): settle the
+    # workspace shape BEFORE anything decides what work exists. Without this a
+    # client could keep several live job folders forever -- the newest file's
+    # import, a re-run, and an interrupted import each left one behind -- and
+    # the run would then pick whichever sorted first, not the newest.
+    workspace_housekeeping(manager)
+    if housekeeping_only:
+        for client_id in manager.known_client_ids():
+            live = manager.live_jobs(client_id)
+            if live:
+                for job_dir, manifest in live:
+                    print(f"[housekeeping] active job {client_id}/"
+                          f"{job_dir.name}: {manifest.get('status', 'imported')}",
+                          flush=True)
+        return
     files = []
     for candidate in manager.discover_inbox():
         name_matches = {candidate.stem.lower()}
@@ -1856,12 +2396,10 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             files.append(candidate)
     pending_jobs = []
     if not files and not legacy:
-        # FIX (Sep 2026, "on each run, log all completed jobs"): first
-        # finish any archive moves that a busy file handle deferred on a
-        # previous completion (never opens a browser), then log every
+        # FIX (Sep 2026, "on each run, log all completed jobs"): log every
         # completed job -- live or archived -- before deciding what still
-        # needs work.
-        manager.retry_deferred_archives()
+        # needs work. (The deferred-archive retry itself already ran, as part
+        # of workspace_housekeeping above, for every run including this one.)
         completed_summaries = manager.completed_job_summaries()
         if completed_summaries:
             print(f"[batch] completed job log ({len(completed_summaries)} job(s)):",
@@ -1959,8 +2497,35 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
 
     # Each worker owns its Playwright browser and module-level workspace paths.
     # Separate processes allow all client browsers to run concurrently without
-    # mixing authentication, progress, or report state.
-    processes = []
+    # mixing authentication, progress, or report state. The parent now starts
+    # only as many child jobs as the global browser-slot budget allows and
+    # keeps one job per client active at a time.
+    if max_parallel < 0:
+        raise ValueError("--max-parallel must be non-negative")
+
+    child_workers = workers
+    if max_parallel > 0 and not dry_run:
+        if auto_scale_workers:
+            distinct_groups = len({workspace.client_id for workspace in workspaces})
+            fair_share = _fair_share_workers(max_parallel, distinct_groups)
+            if fair_share != child_workers:
+                print(
+                    f"[batch] --auto-scale-workers: {distinct_groups} client(s) "
+                    f"ready right now -- giving each job --workers {fair_share} "
+                    f"(of {max_parallel} total slot(s)) instead of the plain "
+                    f"--workers {workers} you passed.",
+                    flush=True,
+                )
+            child_workers = fair_share
+        elif child_workers > max_parallel:
+            print(
+                f"[batch] reducing per-client --workers {child_workers} to "
+                f"--workers {max_parallel} to respect --max-parallel {max_parallel}.",
+                flush=True,
+            )
+            child_workers = max_parallel
+
+    scheduled_jobs = []
     for workspace in workspaces:
         command = [
             sys.executable,
@@ -1972,35 +2537,61 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             command.append("--lock")
         if refresh_catalog:
             command.append("--refresh-catalog")
-        if not enable_tracing:
-            command.append("--no-diagnostics")
+        if enable_tracing:
+            command.append("--enable-diagnostics")
         if dry_run:
             command.append("--dry-run")
-        if workers > 1:
-            command.extend(["--workers", str(workers)])
-        print(
-            f"[batch] launching client {workspace.client_id} job "
-            f"{workspace.job_id} in a separate browser process",
-            flush=True,
-        )
-        processes.append((workspace, subprocess.Popen(command)))
+        if child_workers > 1:
+            command.extend(["--workers", str(child_workers)])
+        slots = 1 if dry_run else child_workers
+        scheduled_jobs.append(ScheduledJob(
+            key=f"{workspace.client_id}:{workspace.job_id}",
+            group=workspace.client_id,
+            command=command,
+            slots=slots,
+            label=f"client {workspace.client_id} job {workspace.job_id}",
+        ))
 
-    failed = False
-    try:
-        for workspace, process in processes:
-            return_code = process.wait()
-            if return_code:
-                failed = True
-                print(
-                    f"[batch] client {workspace.client_id} job {workspace.job_id} "
-                    f"exited with code {return_code}",
-                    flush=True,
-                )
-    except KeyboardInterrupt:
-        for _, process in processes:
-            if process.poll() is None:
-                process.terminate()
-        raise
+    if not scheduled_jobs:
+        return
+
+    cap = "unlimited" if max_parallel == 0 else str(max_parallel)
+    print(
+        f"[batch] scheduling {len(scheduled_jobs)} client job(s) with "
+        f"max_parallel={cap} browser slot(s).",
+        flush=True,
+    )
+    # FIX (Sep 2026, "why is --workers 8 doing nothing?"): the --max-parallel
+    # cap can silently reduce --workers, and the reduction line was easy to
+    # lose in a long run's output. State the EFFECTIVE number every time, right
+    # next to the cap that produced it.
+    reduction = ("" if child_workers == workers else
+                 f" (--max-parallel {max_parallel} reduced your --workers "
+                 f"{workers}; pass --max-parallel 0 for no ceiling)")
+    print(
+        f"[batch] effective --workers {child_workers} per job, "
+        f"{len(scheduled_jobs)} job(s) scheduled{reduction}.",
+        flush=True,
+    )
+
+    def _on_job_start(scheduled_job: ScheduledJob) -> None:
+        print(f"[batch] launching {scheduled_job.label}", flush=True)
+
+    def _on_job_finish(result) -> None:
+        if result.returncode:
+            print(
+                f"[batch] {result.job.label} exited with code "
+                f"{result.returncode}",
+                flush=True,
+            )
+
+    scheduler = ClientProcessScheduler(
+        max_parallel=max_parallel,
+        on_start=_on_job_start,
+        on_finish=_on_job_finish,
+    )
+    results = scheduler.run(scheduled_jobs)
+    failed = any(result.returncode != 0 for result in results)
     if failed:
         print("[batch] one or more client workers failed; inspect each job status.", flush=True)
 
@@ -2027,12 +2618,22 @@ if __name__ == "__main__":
              "the cache is trusted as-is and the live scrape is skipped entirely.",
     )
     parser.add_argument(
+        "--enable-diagnostics",
+        action="store_true",
+        help="OPT IN to the slow debugging extras. They are OFF by default "
+             "because they cost real time on every action: full Playwright "
+             "tracing (a DOM snapshot + a screenshot recorded per action, "
+             "rotated into bounded trace windows) plus per-wait timing "
+             "accounting (WW_WAIT_PROFILE). Use it only for a run you are "
+             "investigating. Closure evidence (screenshot + state .txt/.json) "
+             "is written on an unexpected dialog closure EITHER WAY -- this "
+             "flag only adds the trace .zip and the wait timings.",
+    )
+    parser.add_argument(
         "--no-diagnostics",
         action="store_true",
-        help="Skip starting Playwright tracing for this run, for a bit of extra speed "
-             "on every action. Closure screenshots/.txt/.json evidence is unaffected "
-             "and still written if anything closes unexpectedly -- only the extra "
-             "saved .zip trace is skipped.",
+        dest="no_diagnostics_legacy",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--client", help="Canonical client ID (enables multi-client job layout).")
     parser.add_argument("--source", help="CSV/XLSX source; copied into the job as immutable input.")
@@ -2052,9 +2653,38 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workers", type=int, default=1,
         help="Split this client job across N parallel browser processes "
-             "(requires --client/--job). Each worker owns a disjoint "
-             "slice of the rows and its own retry-queue shard; progress "
-             "and retry persistence are shared/merged exactly as before.")
+             "(requires --client/--job). Workers pull rows from one shared "
+             "claim queue -- each row goes to whichever worker is free next -- "
+             "and each keeps its own retry-queue shard; progress and retry "
+             "persistence are shared/merged exactly as before.")
+    parser.add_argument(
+        "--max-parallel", type=int, default=2,
+        help="Batch-mode global browser-slot cap across client jobs "
+             "(default: 2). Use 0 for unlimited. A child job with "
+             "--workers N consumes N slots; values above the cap are reduced "
+             "so the total active browser count stays bounded.")
+    parser.add_argument(
+        "--auto-scale-workers", action="store_true",
+        help="Batch mode only: instead of giving every client job a fixed "
+             "--workers count, split --max-parallel slots evenly across "
+             "however many DIFFERENT clients actually have work ready right "
+             "now -- one client alone gets the full slot budget, two "
+             "clients ready at once split it in half, and so on. This only "
+             "ever redistributes the SAME --max-parallel ceiling you've "
+             "already been running with -- it never launches more total "
+             "concurrent browser sessions than --max-parallel allows, it "
+             "just stops leaving slots idle when there's only one client "
+             "to give them to. Off by default so existing invocations keep "
+             "their exact current behavior unless you opt in. No effect "
+             "with --max-parallel 0 (unlimited) or outside batch mode.")
+    parser.add_argument(
+        "--housekeeping-only",
+        action="store_true",
+        help="Only tidy the client job directories and exit without opening a browser: "
+             "finish deferred archive moves, quarantine job folders that have no "
+             "manifest, and make sure every client keeps exactly ONE live job "
+             "(older ones move to jobs\\archive\\superseded with all their state).",
+    )
     parser.add_argument("--shard", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     print("[lock] persistent retry mode enabled; press Ctrl+C to stop." if args.lock
@@ -2066,10 +2696,26 @@ if __name__ == "__main__":
             shard = (int(shard_index_s), int(shard_count_s))
         except ValueError:
             raise SystemExit(f"--shard must look like '0/4', got {args.shard!r}")
+    # DIAGNOSTICS (Sep 2026): off unless explicitly asked for, so a normal run
+    # never pays for traces or wait accounting it will not read. The old
+    # --no-diagnostics is still ACCEPTED and ignored, so every existing command
+    # keeps working exactly as written.
+    if args.no_diagnostics_legacy:
+        print("[speed] note: --no-diagnostics is no longer needed -- "
+              "diagnostics are OFF by default now. Pass --enable-diagnostics "
+              "when you actually want traces.", flush=True)
+    # WW_WAIT_PROFILE, when set in the environment, always wins; otherwise
+    # --enable-diagnostics decides, so ONE flag turns on traces + wait timings
+    # together for a debug run.
+    if os.environ.get(wait_profile.ENV_FLAG) is None:
+        wait_profile.PROFILE.enabled = bool(args.enable_diagnostics)
     main(lock_mode=args.lock, refresh_catalog=args.refresh_catalog,
-         enable_tracing=not args.no_diagnostics, client=args.client,
+         enable_tracing=args.enable_diagnostics, client=args.client,
          source=args.source, job=args.job, dry_run=args.dry_run,
          skip_done=args.skip_done,
          legacy=args.legacy,
          skip=tuple(item.strip() for item in args.skip.split(",") if item.strip()),
-         workers=max(1, args.workers), shard=shard)
+         workers=max(1, args.workers), shard=shard,
+         max_parallel=args.max_parallel,
+         auto_scale_workers=args.auto_scale_workers,
+         housekeeping_only=args.housekeeping_only)

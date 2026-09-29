@@ -25,8 +25,12 @@ import pytest
 
 from apps.sniper.product_upload import failed_ledger as fl
 from apps.sniper.product_upload.price_engine import (
-    PriceVarOption, decide_price_offer,
+    PriceVarOption, decide_price_offer, parse_excel_price,
 )
+from apps.sniper.product_upload.product_matcher import (
+    MatchResult, product_for_price,
+)
+from apps.sniper.product_upload.retry_cache import is_transient_failure
 from apps.sniper.client_workspace import WorkspaceManager
 
 
@@ -112,6 +116,134 @@ def test_degenerate_unresolvable_cases_do_not_maneuver():
     assert bad.unresolvable and not bad.needs_custom_price
     empty = decide_price_offer(21500, [])
     assert empty.unresolvable and not empty.needs_custom_price
+
+
+# ------------------------------------------- currency-prefixed Excel prices
+#
+# Regression: client_michael's order file is a CSV whose Price column holds
+# the TEXT "₦28,500" on every row, while client_ephraim's xlsx holds the
+# NUMBER 28500. decide_price_offer used to strip only commas, so float("₦28500")
+# raised, the decision came back with option_data_value="", and _select_combobox
+# was asked to select an empty string -- 3 click attempts, then a transient
+# (not permanent) classification, then a 3x order retry loop. All 69 of
+# Michael's rows were affected; none of Ephraim's.
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (28500, 28500),          # numeric cell (xlsx)
+    (28500.0, 28500),        # numeric cell read as float (michael xlsx)
+    ("28500", 28500),        # bare text
+    ("28,500", 28500),       # grouped text -- the OLD parser handled this
+    ("\u20a628,500", 28500),     # naira sign   <-- the failing case
+    ("N28,500", 28500),          # ASCII fallback for the glyph
+    ("#28,500", 28500),          # hash prefix
+    ("NGN 28,500", 28500),       # spelled-out code
+    ("\u20a6 28,500", 28500),    # sign + space
+    ("  \u20a628,500  ", 28500),   # surrounding whitespace
+])
+def test_parse_excel_price_accepts_every_shape_the_sources_produce(raw, expected):
+    assert parse_excel_price(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["abc", "", "   ", None, "n/a", float("nan"),
+                                 float("inf"), True, False])
+def test_parse_excel_price_rejects_junk_without_raising(raw):
+    """Unparseable input must return None, never raise -- the callers keep
+    their existing flag-for-manual-review branch on None."""
+    assert parse_excel_price(raw) is None
+
+
+def test_naira_prefixed_price_resolves_like_the_numeric_form():
+    """The whole point: '₦28,500' and 28500 must reach the SAME decision."""
+    opts = [PriceVarOption(label="bundle A", value="a", price=47500)]
+
+    text = decide_price_offer("\u20a628,500", opts)
+    numeric = decide_price_offer(28500, opts)
+
+    assert text.target_price == numeric.target_price == 28500
+    assert (text.unresolvable, text.needs_custom_price) == \
+           (numeric.unresolvable, numeric.needs_custom_price)
+    # Not the degenerate branch any more: there IS something to select.
+    assert text.option_data_value == "a"
+    assert text.option_data_value != ""
+
+
+def test_product_for_price_uses_the_same_parser():
+    """product_matcher already stripped the glyph; price_engine did not. Both
+    now share one parser, so the two entry points cannot drift apart again."""
+    catalog = ["Sadoer Collagen Combo + Body Lotion"]
+    assert (product_for_price("\u20a628,500", catalog).matched_product
+            == product_for_price(28500, catalog).matched_product)
+    assert product_for_price("junk", catalog) is None
+
+
+# ------------------------------------------------ the empty-value loop guard
+
+
+def test_empty_option_value_is_refused_before_any_click():
+    """The loop breaker. An unparseable price yields option_data_value="",
+    and no dropdown option can ever equal "" -- so _select_combobox must never
+    be reached. Previously it was, retried 3x, and the whole order retried
+    3x on top of that."""
+    from apps.sniper.product_upload import add_products as ap
+
+    decision = decide_price_offer("n/a",
+                                  [PriceVarOption(label="a", value="a", price=1)])
+    assert decision.option_data_value == ""
+
+    match = MatchResult(excel_text="x", normalized="x", matched_product="P",
+                        confidence=1.0, confidence_band="high", reason="")
+    err = ap._require_selectable_price_option(decision, match, 0)
+
+    assert err is not None
+    assert "empty value" in err
+    # Wording must match the permanent marker, or the failure is classified
+    # transient again and the retry storm comes straight back.
+    assert is_transient_failure(err) is False
+
+
+def test_selectable_option_passes_the_guard():
+    from apps.sniper.product_upload import add_products as ap
+
+    decision = decide_price_offer(21500,
+                                  [PriceVarOption(label="a", value="a", price=21500)])
+    match = MatchResult(excel_text="x", normalized="x", matched_product="P",
+                        confidence=1.0, confidence_band="high", reason="")
+    assert ap._require_selectable_price_option(decision, match, 0) is None
+
+
+def test_unparseable_price_is_permanent_not_transient():
+    """Same input always fails the same way, so retrying it is pure waste."""
+    reason = decide_price_offer("junk-price", []).reason
+    assert "could not parse Excel price" in reason
+    assert is_transient_failure(reason) is False
+
+
+def test_empty_dropdown_read_surfaces_as_a_permanent_failure():
+    """A dropdown whose options carry no parseable price cannot become
+    selectable by re-running the same order, so the message the user
+    actually sees must be classified permanent.
+
+    Note the raw decide_price_offer reason ("no priced bundle options ...")
+    is intentionally NOT a permanent marker: the live-read path in
+    _select_product_and_price can legitimately see an empty list while the
+    options are still rendering, and that case already has its own recovery
+    (cache invalidation + a fresh read). It is the GUARD's rewritten message
+    -- the one that means "we have nothing to select and never will" -- that
+    must be permanent, so the empty-value retry storm cannot return.
+    """
+    from apps.sniper.product_upload import add_products as ap
+
+    match = MatchResult(excel_text="x", normalized="x", matched_product="P",
+                        confidence=1.0, confidence_band="high", reason="")
+
+    decision = decide_price_offer(21500, [])
+    assert "no priced bundle options" in decision.reason
+
+    err = ap._require_selectable_price_option(decision, match, 0)
+    assert err is not None
+    assert "no priced bundle options" in err      # the cause is preserved
+    assert is_transient_failure(err) is False    # but it is not retried
 
 
 # ------------------------------------------------------------- workspace

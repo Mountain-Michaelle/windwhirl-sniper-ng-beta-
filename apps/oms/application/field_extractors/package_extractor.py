@@ -4,7 +4,7 @@ import re
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.oms.application.models.parsed_order import PackageInfo
+    from apps.oms.application.models.parsed_order import PackageInfo
 
 
 class PackageExtractor:
@@ -43,7 +43,7 @@ class PackageExtractor:
         Returns:
             PackageInfo if package section found, else None.
         '''
-        from app.oms.application.models.parsed_order import PackageInfo
+        from apps.oms.application.models.parsed_order import PackageInfo
 
         raw_value = self._find_section(sections)
         if not raw_value:

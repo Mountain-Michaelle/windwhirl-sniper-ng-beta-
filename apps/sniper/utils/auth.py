@@ -205,7 +205,7 @@ def login(page, login_url: str, target_url: str, logged_in_selector: str,
     order downstream fails for a confusing reason."""
     email, password = _get_credentials(client_id, credential_reference, env_file, cache_file)
 
-    safe_goto(page, login_url, wait_until="commit")
+    safe_goto(page, login_url, wait_until="commit", settle_ms=0)
 
     _fill_resilient(page, EMAIL_INPUT_SELECTOR, EMAIL_INPUT_FALLBACK,
                      email, "email", network_wait_timeout_ms)
@@ -227,7 +227,7 @@ def login(page, login_url: str, target_url: str, logged_in_selector: str,
         )
 
     if target_url:
-        safe_goto(page, target_url, wait_until="commit")
+        safe_goto(page, target_url, wait_until="commit", settle_ms=0)
     page.wait_for_selector(logged_in_selector, timeout=network_wait_timeout_ms)
 
 
@@ -267,7 +267,7 @@ def login_with_session_cache(browser, login_url: str, target_url: str,
             context = browser.new_context(storage_state=str(storage_file))
             page = context.new_page()
             try:
-                safe_goto(page, target_url, wait_until="commit")
+                safe_goto(page, target_url, wait_until="commit", settle_ms=0)
                 page.wait_for_selector(logged_in_selector, timeout=8000)
                 _write_auth_metadata(metadata_path, client_id, "reused")
                 return context, page  # reused session -- no login needed

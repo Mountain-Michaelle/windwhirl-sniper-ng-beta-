@@ -1,0 +1,8 @@
+client_id: client_precious_a492616c
+name_key: precious
+display_name: precious
+created_at: "2026-09-27T19:59:07Z"
+enabled: true
+credential_reference: env:PRECIOUS_A492616C
+# Configure crm_account_id before uploading.
+crm_account_id: client_precious_a492616c

@@ -6,8 +6,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.oms.application.models.parsed_order import ParsedOrder
-    from app.oms.application.models.validation_report import ValidationReport
+    from apps.oms.application.models.parsed_order import ParsedOrder
+    from apps.oms.application.models.validation_report import ValidationReport
 
 
 @dataclass

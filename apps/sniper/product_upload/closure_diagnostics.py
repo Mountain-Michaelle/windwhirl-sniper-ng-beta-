@@ -55,6 +55,7 @@ import json
 import os
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import apps.sniper.utils.field_selectors as sel
@@ -120,6 +121,100 @@ def _bump(cfg, key: str, by: int = 1) -> None:
         cfg.perf_counters[key] = cfg.perf_counters.get(key, 0) + 1
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Trace-window rotation (only ever active while --enable-diagnostics tracing
+# is running)
+# ---------------------------------------------------------------------------
+# WHY: Playwright buffers a trace CHUNK in memory until it is stopped. The
+# diagnostic mode opens one chunk at startup and (before this) only stopped it
+# when a closure was captured or the browser closed -- so a 200+ order debug
+# run accumulated the snapshots/screenshots of the WHOLE run in RAM. Rotating
+# flushes the current window to a bounded two-file ring every
+# cfg.trace_chunk_rotate_orders attempts, so peak memory depends on the
+# rotation interval, not on the run length.
+#
+# The two slots alternate (trace_window_0.zip / trace_window_1.zip), so the
+# most recent window is always on disk alongside the one before it -- a crash
+# that never reaches a closure capture still leaves the trace of the orders
+# leading up to it. Both files live under cfg.diagnostics_dir (already a
+# replaceable, git-ignored generated directory) and are bounded at two files
+# by construction.
+_TRACE_ROTATION: dict = {
+    "active": False,   # set only when tracing really started
+    "since": 0,        # order attempts observed since the last rotation
+    "slot": 0,         # which of the two window files to write next
+    "dir": None,       # where those two window files live
+}
+
+
+def enable_trace_rotation(diagnostics_dir: str) -> None:
+    """Arm the rotator for a run whose tracing actually started. Called by
+    run_upload.py once the AutomationConfig exists, so windows land in the
+    SAME directory the closure evidence goes to. Never raises -- a rotation
+    problem must never affect the automation."""
+    _TRACE_ROTATION["active"] = True
+    _TRACE_ROTATION["since"] = 0
+    _TRACE_ROTATION["slot"] = 0
+    _TRACE_ROTATION["dir"] = str(diagnostics_dir or "")
+
+
+def maybe_rotate_trace_chunk(page, cfg, row_number: Optional[int] = None) -> None:
+    """Called once per order attempt by run_upload.py's _attempt_order.
+
+    A no-op unless (a) the rotator was armed, which only happens when
+    Playwright tracing really is running, and (b) at least
+    cfg.trace_chunk_rotate_orders attempts have passed since the last
+    rotation. On a normal run (diagnostics off) this is one dict lookup per
+    order and nothing else.
+
+    Every existing guarantee is preserved: the closure capture in
+    _capture_closure_evidence still stops and SAVES the chunk covering the
+    closure and still re-arms a fresh one immediately afterwards. Worst case
+    (a tracing call fails) the rotator goes quiet for the rest of the run and
+    the run itself is completely unaffected.
+    """
+    if not _TRACE_ROTATION["active"]:
+        return
+    try:
+        every = int(getattr(cfg, "trace_chunk_rotate_orders", 0) or 0)
+    except Exception:
+        return
+    if every <= 0:
+        return
+    _TRACE_ROTATION["since"] += 1
+    if _TRACE_ROTATION["since"] < every:
+        return
+    _TRACE_ROTATION["since"] = 0
+
+    slot = _TRACE_ROTATION["slot"]
+    _TRACE_ROTATION["slot"] = 1 - slot
+    target_dir = _TRACE_ROTATION["dir"]
+    path = None
+    try:
+        if target_dir:
+            Path(target_dir).mkdir(parents=True, exist_ok=True)
+            path = os.path.join(target_dir,
+                                "trace_window_%d_pid%d.zip" % (slot, os.getpid()))
+        if path:
+            page.context.tracing.stop_chunk(path=path)
+        else:
+            page.context.tracing.stop_chunk(discard=True)
+    except Exception:
+        _emit(cfg, "[diagnostics] trace window rotation could not flush its "
+                   "window (continuing without rotation evidence).")
+    try:
+        page.context.tracing.start_chunk(name="window_after_row%s" % row_number)
+    except Exception:
+        # No fresh chunk means tracing is effectively over for this run; stop
+        # trying so we never pay for a losing tracing call on every order.
+        _TRACE_ROTATION["active"] = False
+        return
+    if path:
+        _emit(cfg, "[diagnostics] trace window rotated at row %s -> %s "
+                   "(bounded to %d order(s) per window)."
+                   % (row_number, path, every))
 
 
 def _describe_visible_combos(page, max_combos: int = 12) -> list[dict]:

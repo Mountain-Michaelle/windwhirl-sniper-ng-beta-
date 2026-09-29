@@ -28,7 +28,32 @@ from typing import Optional
 
 from apps.sniper.product_upload.progress_tracker import order_key
 
-MAX_RETRY_ATTEMPTS = 3
+# FIX (persistence-hardening pass, "even more persistency and harsh
+# retries so no unbreaking error will slow down my upload"): this used to
+# be a bare literal with no way to raise it without editing source. A
+# transient failure (network blip, DOM not settled yet) deserves more than
+# 3 chances before an order is written off as permanent -- especially
+# since each attempt already goes through _attempt_order's own in-process
+# lock-mode retry loop first (see run_upload.py), so by the time an entry
+# even reaches this cache it has already survived that. Overridable via
+# WW_MAX_RETRY_ATTEMPTS for a client that needs it harsher still, without
+# a code change; invalid/non-positive values fall back to the default
+# rather than silently disabling the give-up threshold.
+_DEFAULT_MAX_RETRY_ATTEMPTS = 5
+
+
+def _resolve_max_retry_attempts() -> int:
+    raw = os.environ.get("WW_MAX_RETRY_ATTEMPTS", "")
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    return _DEFAULT_MAX_RETRY_ATTEMPTS
+
+
+MAX_RETRY_ATTEMPTS = _resolve_max_retry_attempts()
 
 # Reasons that mean "the CRM/data itself said no" -- retrying changes
 # nothing, so these skip the queue and go straight to the permanent
@@ -41,6 +66,14 @@ PERMANENT_REASON_MARKERS = (
     "order has no usable value for",  # source data genuinely empty
     "error indicator matched",      # the CRM itself rejected it (duplicate, validation, etc.)
     "flagged as",
+    # An Excel price that cannot be parsed is a property of the SOURCE FILE,
+    # not of the page: re-reading the same cell returns the same string, and
+    # retrying the identical order can only reproduce the identical failure.
+    # Before these two markers, an unparseable price was misread as transient
+    # and drove a 3x order retry loop (with cache invalidation + live re-reads
+    # each round) that stalled the row instead of flagging it for review.
+    "could not parse excel price",
+    "refusing to open the price dropdown for an empty value",
 )
 
 

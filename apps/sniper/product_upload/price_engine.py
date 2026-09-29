@@ -91,6 +91,58 @@ _PRICE_RE = re.compile(r"[₦N]\s?([\d,]+)", re.IGNORECASE)
 
 MAX_TRAILING_EDIT_DIGITS = 2
 
+# The Excel price cell is NOT the same shape for every client, and the shape
+# decides whether the row uploads at all:
+#   * a numeric cell (openpyxl/xlsx, or a CSV pandas inferred as int64) ->
+#     28500 or 28500.0
+#   * a text cell -> "₦28,500", "N28,500", "#28,500", "28,500"
+# client_michael's CSV arrives in the second form for EVERY row (69/69
+# verified), while client_ephraim's xlsx arrives in the first. That is the
+# entire reason only one client failed: decide_price_offer used to strip only
+# commas, so float("₦28500") raised and the row could never resolve a price.
+#
+# One canonical parser, shared with product_matcher.product_for_price, so the
+# two entry points can never drift apart again -- they already had (one
+# stripped the currency glyph, the other did not).
+#
+# Anchored to the START of the value on purpose: a price is a currency token
+# followed by digits, and only that leading token is removed. Stripping
+# currency characters anywhere would also mangle junk like "abc" into
+# something that looks parseable, which is the opposite of what we want.
+_CURRENCY_PREFIX_RE = re.compile(
+    r"^\s*(?:ngn|₦|n|\$|€|£|#|rupees?|rs\.?)?\s*", re.IGNORECASE)
+
+
+def parse_excel_price(value) -> Optional[int]:
+    """Normalize an Excel price cell to a whole-naira int, or None.
+
+    Accepts every shape the source files actually produce:
+        28500, 28500.0, "28500", "28,500", "₦28,500", "N28,500", "#28,500",
+        "NGN 28,500", "₦ 28,500", and whitespace around any of those.
+
+    Returns None (never raises) for genuinely unparseable input such as
+    "abc", "", None or NaN, so callers keep their existing
+    flag-for-manual-review branch instead of crashing.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):          # bool is an int subclass; not a price
+        return None
+    if isinstance(value, (int, float)):
+        # NaN/inf reach here from blank Excel cells read as float.
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return int(round(float(value)))
+
+    text = _CURRENCY_PREFIX_RE.sub("", str(value), count=1)
+    text = text.replace(",", "").replace(" ", "").strip()
+    if not text:
+        return None
+    try:
+        return int(round(float(text)))
+    except (TypeError, ValueError):
+        return None
+
 
 @dataclass
 class PriceVarOption:
@@ -180,9 +232,8 @@ def decide_price_offer(excel_price, options: list[PriceVarOption]) -> PriceOffer
          selection) with unresolvable=True, exactly as before. Nothing
          is ever guessed or forced past the verified cap.
     """
-    try:
-        target = int(round(float(str(excel_price).replace(",", "").strip())))
-    except (TypeError, ValueError):
+    target = parse_excel_price(excel_price)
+    if target is None:
         return PriceOfferDecision(
             option_data_value="", option_label="", bundle_price=None,
             needs_amount_edit=False, unresolvable=True,

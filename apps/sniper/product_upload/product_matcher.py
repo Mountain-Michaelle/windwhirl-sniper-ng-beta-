@@ -54,6 +54,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Iterable, Optional
 
+from apps.sniper.product_upload.price_engine import parse_excel_price
+
 try:
     from rapidfuzz import fuzz as _rf_fuzz
     _HAVE_RAPIDFUZZ = True
@@ -318,10 +320,8 @@ def product_for_price(excel_price, crm_catalog: list[str]) -> Optional[MatchResu
     """Price -> product fallback. Returns a flagged MatchResult when the Excel
     price is a known package price whose bundle exists in the live catalog,
     else None (caller keeps its normal failure path)."""
-    try:
-        price = int(round(float(str(excel_price).replace(",", "").replace("₦", "")
-                                .replace("#", "").strip())))
-    except (TypeError, ValueError):
+    price = parse_excel_price(excel_price)
+    if price is None:
         return None
     target = PRICE_TO_PRODUCT.get(price)
     if target is None:

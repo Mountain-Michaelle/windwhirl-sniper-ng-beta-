@@ -122,6 +122,7 @@ from apps.sniper.product_upload.closure_diagnostics import (
     _OVERLAY_SELECTOR,
 )
 from apps.sniper.product_upload import fast_waits as _fw
+from apps.sniper.product_upload import wait_profile
 
 
 def _wait_for_stable_value(locator, cfg: AutomationConfig, timeout_ms: int = 300) -> str:
@@ -154,33 +155,18 @@ def _wait_for_option_render(scope, cfg: AutomationConfig, timeout_ms: Optional[i
     rather than the whole page, everywhere this is called) but accepts
     anything with a compatible .locator() method, including `page`."""
     timeout_ms = cfg.option_render_wait_ms if timeout_ms is None else timeout_ms
-    if getattr(scope, "element_handle", None) is not None:
-        # PERF: Locator scope -- in-page child-count stability wait (one
-        # round trip) via fast_waits; its fallback replicates the original
-        # polling loop exactly.
-        _fw.wait_count_stable(scope, child_selector=sel.OPTION_SELECTOR,
-                               timeout_ms=timeout_ms, min_stable_ms=50, poll_ms=25)
-        return
-    # Page scope (no element_handle): original Python polling loop.
-    deadline = time.time() + timeout_ms / 1000
-    try:
-        prev = scope.locator(sel.OPTION_SELECTOR).count()
-    except Exception:
-        return
-    stable_reads = 0
-    while time.time() < deadline:
-        time.sleep(0.025)
-        try:
-            cur = scope.locator(sel.OPTION_SELECTOR).count()
-        except Exception:
-            return
-        if cur == prev:
-            stable_reads += 1
-            if stable_reads >= 2:
-                return
-        else:
-            stable_reads = 0
-            prev = cur
+    # PERF (Phase 1): the page-scope branch that used to live here was a
+    # hand-rolled Python polling loop (time.sleep(0.025) + a .count() round
+    # trip per iteration). wait_count_stable() already handles BOTH scopes:
+    # a Locator scope runs the in-page one-round-trip stability wait, and a
+    # scope with no .element_handle (i.e. page) delegates to _py_wait_count_
+    # stable -- which is the same loop, faithfully, with the same 25ms poll
+    # and the same "2 consecutive equal reads" exit. So this is now ONE
+    # code path instead of two, with identical semantics, and it is
+    # instrumented (wait_count_stable / fallback.wait_count_stable) so the
+    # page-scope cost shows up in the wait profile instead of hiding here.
+    _fw.wait_count_stable(scope, child_selector=sel.OPTION_SELECTOR,
+                           timeout_ms=timeout_ms, min_stable_ms=50, poll_ms=25)
 
 def _wait_stable(locator, timeout_ms: int = 350, interval_s: float = 0.03) -> None:
     # PERF: in-page bounding-box stability wait via fast_waits (its
@@ -200,6 +186,7 @@ def _wait_for_overlay_gone(page, cfg: AutomationConfig, timeout_ms: Optional[int
     than the timeout -- callers still proceed and let their own
     click-retry logic absorb the rest."""
     timeout_ms = cfg.overlay_gone_timeout_ms if timeout_ms is None else timeout_ms
+    t0 = time.perf_counter()
     try:
         overlay = page.locator(_OVERLAY_SELECTOR)
         if overlay.count() == 0:
@@ -207,6 +194,10 @@ def _wait_for_overlay_gone(page, cfg: AutomationConfig, timeout_ms: Optional[int
         overlay.first.wait_for(state="hidden", timeout=timeout_ms)
     except Exception:
         pass
+    finally:
+        # One accounting point covering the no-overlay early return, the
+        # normal hidden wait, and the exception path.
+        wait_profile.add("overlay_gone", (time.perf_counter() - t0) * 1000.0)
 
 def _retry_on_timeout(action, cfg: AutomationConfig, label: str,
                        retries: Optional[int] = None,
@@ -249,22 +240,29 @@ def click_resilient(scope, candidates: list[Callable], label: str,
     here -- only dead time to pay when the SPA's router activity is
     mistaken for one."""
     last_err = None
-    for make_locator in candidates:
-        try:
-            loc = make_locator(scope)
-            loc.first.wait_for(state="visible", timeout=timeout_ms)
-            loc.first.click(no_wait_after=True)
-            return
-        except PWTimeoutError as e:
-            last_err = e
-            continue
-        except Exception as e:
-            last_err = e
-            continue
-    raise PWTimeoutError(
-        f"click_resilient({label}): none of {len(candidates)} selector strategy(ies) "
-        f"worked within {timeout_ms}ms. Last error: {last_err}"
-    )
+    t0 = time.perf_counter()
+    try:
+        for make_locator in candidates:
+            try:
+                loc = make_locator(scope)
+                loc.first.wait_for(state="visible", timeout=timeout_ms)
+                loc.first.click(no_wait_after=True)
+                return
+            except PWTimeoutError as e:
+                last_err = e
+                continue
+            except Exception as e:
+                last_err = e
+                continue
+        raise PWTimeoutError(
+            f"click_resilient({label}): none of {len(candidates)} selector strategy(ies) "
+            f"worked within {timeout_ms}ms. Last error: {last_err}"
+        )
+    finally:
+        # One accounting point covering the successful click and the
+        # all-candidates-failed raise. Also bumped on failure so a run that
+        # is quietly burning its full click budget per attempt is visible.
+        wait_profile.add("click_resilient", (time.perf_counter() - t0) * 1000.0)
 
 def _dialog_open_state(dialog) -> Optional[bool]:
     try:
@@ -958,20 +956,38 @@ def _click_final_submit(dialog, cfg: AutomationConfig) -> Optional[str]:
     return _retry_on_timeout(do_click, cfg, "final Add Order submit")
 
 def detect_save_outcome(dialog, cfg: AutomationConfig) -> tuple[str, str]:
+    # PERF (Phase 0): this is the single longest blocking wait in the whole
+    # order -- it sits on dialog.wait_for(state="hidden") for up to
+    # cfg.success_wait_timeout_ms. It is a genuine signal wait (it returns
+    # the moment the dialog really closes), so it stays; but its cost is
+    # now measured, so Phase 0 can say for FACT whether submit-detection is
+    # the bottleneck instead of guessing.
+    t0 = time.perf_counter()
     try:
         dialog.wait_for(state="hidden", timeout=cfg.success_wait_timeout_ms)
         return "success", "order dialog closed after submit"
     except PWTimeoutError:
         pass
+    finally:
+        wait_profile.add("save_outcome_dialog_hidden",
+                         (time.perf_counter() - t0) * 1000.0)
 
-    for err_sel in cfg.error_selectors:
-        try:
-            loc = dialog.locator(err_sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                text = loc.first.inner_text().strip()
-                return "failure", f"error indicator matched ({err_sel!r}): {text}"
-        except Exception:
-            continue
+    t1 = time.perf_counter()
+    try:
+        for err_sel in cfg.error_selectors:
+            try:
+                loc = dialog.locator(err_sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    text = loc.first.inner_text().strip()
+                    return "failure", f"error indicator matched ({err_sel!r}): {text}"
+            except Exception:
+                continue
+    finally:
+        # Single accounting point: the finally also covers the early
+        # `return` above, so an error-indicator hit is counted once, not
+        # twice.
+        wait_profile.add("save_outcome_error_scan",
+                         (time.perf_counter() - t1) * 1000.0)
 
     return "inconclusive", "dialog still open after submit and no error indicator found"
 

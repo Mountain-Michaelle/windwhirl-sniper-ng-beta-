@@ -1,0 +1,8 @@
+client_id: client_fransisca_28a701dd
+name_key: fransisca
+display_name: fransisca
+created_at: "2026-09-28T21:02:07Z"
+enabled: true
+credential_reference: env:FRANSISCA_28A701DD
+# Configure crm_account_id before uploading.
+crm_account_id: client_fransisca_28a701dd

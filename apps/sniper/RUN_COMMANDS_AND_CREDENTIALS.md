@@ -144,14 +144,38 @@ Important distinction:
 - `job.lock` and `auth.lock` are filesystem process locks that prevent
   conflicting workers from using the same job/client resources.
 
-### Disable Playwright trace recording
+### Diagnostics: OFF by default, opt in only to debug
 
 ```powershell
-python run_upload.py --no-diagnostics
+python run_upload.py --enable-diagnostics
 ```
 
-This skips the extra Playwright trace ZIP. Failure screenshots, diagnostic
-text, JSON evidence, and ordinary failure reports are still written.
+Diagnostics are OFF unless you ask for them, because they cost real time on
+every single action:
+
+| | default (diagnostics off) | with `--enable-diagnostics` |
+|---|---|---|
+| Playwright tracing (a DOM snapshot + screenshot per action) | not started | recorded, rotated into bounded `.zip` trace windows |
+| Per-wait timing report (`[wait-profile] ...`) | not collected | collected and printed (same as `WW_WAIT_PROFILE=1`) |
+| Per-order phase timings (`[metrics] browser phases ms: ...`) | **still printed** | still printed |
+| Closure evidence on an unexpected dialog close (screenshot + state `.txt`/`.json`) | **still written** | still written |
+
+Turning diagnostics off therefore does NOT cost you your failure evidence or
+your per-order `[metrics]` breakdown -- only the extra trace `.zip` and the
+wait-timing report. Turn it on for a run you are investigating, not for a
+normal upload.
+
+`--no-diagnostics` is still accepted, but it is now a no-op (diagnostics are
+already off), so every existing command keeps working unchanged.
+
+`WW_WAIT_PROFILE` remains a fine-grained override: `WW_WAIT_PROFILE=1` turns
+the wait timings on for one run without enabling traces, and
+`WW_WAIT_PROFILE=0` forces them off even under `--enable-diagnostics`.
+
+When tracing is on, the open trace chunk is rotated every 25 order attempts
+into a two-file ring (`trace_window_0.zip` / `trace_window_1.zip` under the
+run's diagnostics directory), so a long debug run cannot grow unbounded in
+memory, and the window just before a crash is still on disk.
 
 ### Refresh a client's catalog
 
@@ -185,6 +209,81 @@ python run_upload.py --skip-done
 
 This is the default behavior. The flag is retained for explicitness. Orders
 already present in the durable client progress database are not resubmitted.
+
+---
+
+## 2b. Speed, parallelism and diagnostics flags
+
+These flags decide how much of your machine the upload uses and how much
+evidence a run records. None of them change what an order contains.
+
+| Flag | Default | What it does | When to change it |
+|---|---|---|---|
+| `--workers N` | `1` | Splits ONE client job across N separate browser processes. All N pull rows from one shared claim queue (whichever worker is free next gets the next row), so a row is never submitted twice. Per-order time is unchanged; total run time drops by roughly N times. Each worker is its own Chromium (about 300-500 MB RAM plus CPU). | The single biggest lever on total run time. Start at 4, then try 6-8 while watching for CRM-side throttling. |
+| `--max-parallel N` | `2` | The GLOBAL ceiling on how many browsers may be open at once across all client jobs, used by the inbox/batch run. `0` means no ceiling. | Raise it whenever you raise `--workers`. See the warning below - this is the flag that silently cancels your speed-up. |
+| `--auto-scale-workers` | off | Batch mode only: divides the `--max-parallel` budget among however many DIFFERENT clients have work ready right now (1 client gets all slots, 2 clients get half each). Never opens more browsers than `--max-parallel` allows. | Only useful when several clients are queued at once. If you always name one client, use `--workers` instead. |
+| `--housekeeping-only` | off | Opens no browser and logs in nowhere. Only repairs the job folders: finishes deferred archive moves, quarantines job folders with no manifest, enforces one live job per client (older ones move to `jobs\archive\superseded` with their state), and prunes old archives. | When `clients` has accumulated junk, or when you want to see which job is currently live. |
+| `--enable-diagnostics` | off | Records the slow debugging extras: full Playwright tracing plus wait-timing accounting. | Only for a run you are investigating. See the diagnostics section above. |
+
+### WARNING: `--workers` alone is not enough in inbox/batch mode
+
+In the mode where you do NOT name a client (the run that drains `_inbox` and
+every pending job), any `--workers` value above `--max-parallel` is reduced to
+`--max-parallel`:
+
+```text
+[batch] reducing per-client --workers 8 to --workers 2 to respect --max-parallel 2.
+```
+
+So `--workers 8` becomes 2 unless you also pass `--max-parallel 0` (no ceiling)
+or a matching number. Every run now prints the number it is really using, so
+this can never pass unnoticed again:
+
+```text
+[batch] effective --workers 8 per job, 1 job(s) scheduled.
+[run] diagnostics=off  --workers=4  shard 1/4
+[shard] sharing 283 row(s) through one claim queue across 4 worker(s) -- ...
+```
+
+If `[batch] effective --workers` shows a smaller number than the one you
+passed, the cap did it.
+
+Note the two modes behave differently: `--client X --job Y` runs use your
+`--workers` exactly as given (no cap is applied), while the inbox/batch run
+applies `--max-parallel`.
+
+### Recipes
+
+Normal fast run of one job (diagnostics are already off by default):
+
+```powershell
+python run_upload.py --client client_michael_0c05e53b --job <job_id> --lock --workers 4
+```
+
+Inbox/batch run across every pending job, with the ceiling lifted:
+
+```powershell
+python run_upload.py --lock --workers 4 --max-parallel 0
+```
+
+One job while you debug it (slower on purpose):
+
+```powershell
+python run_upload.py --client client_michael_0c05e53b --job <job_id> --lock --workers 1 --enable-diagnostics
+```
+
+Repair and report only (no browser, no uploads):
+
+```powershell
+python run_upload.py --housekeeping-only
+```
+
+### A note on `--skip-done`
+
+`--skip-done` is on by default and currently has no off-switch, so it cannot
+be disabled from the command line. That is deliberate today (an order already
+in the durable progress database must never be resubmitted), which also means
+passing `--skip-done` changes nothing.
 
 ---
 

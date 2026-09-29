@@ -238,15 +238,12 @@ def _page_turned(page, before_label: str, before_first: str) -> bool:
 
 def _wait_page_turn(page, before_label: str, before_first: str,
                     timeout_s: float = 20.0) -> bool:
-    """True once `_page_turned` proves the turn (bounded poll, no sleep)."""
+    """True once `_page_turned` proves the turn (bounded poll, safe wait)."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if _page_turned(page, before_label, before_first):
             return True
-        try:
-            page.wait_for_timeout(300)
-        except Exception:                             # noqa: BLE001
-            return False
+        _page_wait(page, 300)
     return _page_turned(page, before_label, before_first)
 
 
@@ -286,18 +283,115 @@ def _reset_to_first_page(driver: DeliverDriver, max_pages: int = 40) -> bool:
     return _page_number(_page_label(driver.page)) == 1
 
 
+def _page_wait(page, ms: int) -> None:
+    """Safe wait on a Playwright page or mock object."""
+    try:
+        if hasattr(page, "wait_for_timeout"):
+            page.wait_for_timeout(ms)
+        else:
+            time.sleep(ms / 1000.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _click_next_with_retry(page, before_label: str, before_first: str,
+                           page_idx: int) -> bool:
+    """Click the Next button with back-to-back 3x retry, wait, another 3x retry.
+
+    Total: 2 rounds of 3 attempts (6 total attempts) before giving up.
+    Uses DOM scroll, standard Playwright click, JS-click fallback, and verifies
+    actual page advancement via _wait_page_turn.
+    """
+    for round_num in (1, 2):
+        for attempt in range(1, 4):
+            try:
+                next_btn = None
+                if hasattr(page, "get_by_role"):
+                    try:
+                        next_btn = page.get_by_role(
+                            "button", name=re.compile(r"^Next$", re.I)).first
+                    except Exception:  # noqa: BLE001
+                        pass
+                if (next_btn is None or not getattr(next_btn, "count", lambda: 0)()) and hasattr(page, "locator"):
+                    try:
+                        next_btn = page.locator('button:has-text("Next")').first
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                btn_count = next_btn.count() if (next_btn is not None and hasattr(next_btn, "count")) else 0
+                if not btn_count:
+                    if round_num == 1 and attempt == 1:
+                        print(f"[scan] page {page_idx}: Next button not found in DOM",
+                              flush=True)
+                    return False
+
+                # Ensure enabled: short wait/poll if currently disabled
+                is_enabled = False
+                for _ in range(5):
+                    if hasattr(next_btn, "is_enabled") and next_btn.is_enabled():
+                        is_enabled = True
+                        break
+                    _page_wait(page, 300)
+
+                if not is_enabled:
+                    # If this is round 2 attempt 3, Next is genuinely disabled (last page)
+                    if round_num == 2 and attempt == 3:
+                        return False
+                    _page_wait(page, 400)
+                    continue
+
+                # Scroll into view to clear sticky footers
+                try:
+                    if hasattr(next_btn, "scroll_into_view_if_needed"):
+                        next_btn.scroll_into_view_if_needed(timeout=4000)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # Try Playwright click first; on failure, fallback to JS click
+                try:
+                    if hasattr(next_btn, "click"):
+                        next_btn.click(timeout=6000)
+                except Exception as click_err:  # noqa: BLE001
+                    try:
+                        if hasattr(next_btn, "evaluate"):
+                            next_btn.evaluate("el => el.click()")
+                    except Exception:  # noqa: BLE001
+                        print(f"[scan] page {page_idx}: click failed (round {round_num}, "
+                              f"attempt {attempt}/3): {click_err}", flush=True)
+                        _page_wait(page, 500)
+                        continue
+
+                # Verify that page actually turned
+                if _wait_page_turn(page, before_label, before_first, timeout_s=10.0):
+                    return True
+
+                print(f"[scan] page {page_idx}: clicked Next but page did not turn yet "
+                      f"(round {round_num}, attempt {attempt}/3)", flush=True)
+                _page_wait(page, 600)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[scan] page {page_idx}: pagination retry error (round {round_num}, "
+                      f"attempt {attempt}/3): {exc}", flush=True)
+                _page_wait(page, 500)
+
+        if round_num == 1:
+            # Pausing between round 1 (3x) and round 2 (3x)
+            _page_wait(page, 1500)
+
+    return False
+
+
 def collect_tab_pages(driver: DeliverDriver, expected: int = 0,
                       max_pages: int = 40) -> list:
     """Every raw row of the current tab, page by page (Prev/Next pager).
 
-    Read the settled page -> click Next (enabled only) -> wait for the
-    next page to land -> repeat until Next is gone/disabled or the
+    Read the settled page -> click Next (enabled only) with enduring retries ->
+    wait for the next page to land -> repeat until Next is gone/disabled or the
     "Page N of N" label stops advancing. Order-ID dedupe across pages, so
     a re-rendered page can never double-count a row.
     """
     seen_order: set = set()
     pages: list = []
-    for _ in range(1, max_pages + 1):
+    for page_idx in range(1, max_pages + 1):
         # Two waits, in order: first a bounded "at least one row exists"
         # (wait_for_orders_ready), then poll until the row count has
         # STOPPED MOVING. The old first-row-only wait returned while pages
@@ -305,27 +399,17 @@ def collect_tab_pages(driver: DeliverDriver, expected: int = 0,
         # fully rendered.
         driver.wait_for_orders_ready()
         wait_for_rows_settled(driver)
-        pages.append(collect_page_rows(driver))
+        current_rows = collect_page_rows(driver)
+        pages.append(current_rows)
         before = _page_label(driver.page)
         before_first = _page_first_id(driver.page)
-        try:
-            next_btn = driver.page.get_by_role(
-                "button", name=re.compile(r"^Next$", re.I)).first
-            if not (next_btn.count() and next_btn.is_enabled()):
-                break                                 # last page reached
-            # The pager sits under a sticky footer: an instant click can hit
-            # the overlay instead, leaving the page un-advanced while the
-            # click "succeeds". Scrolling it into view first lands the
-            # click; _wait_page_turn then requires BOTH proofs (label AND
-            # first order id) before the next page may be read.
-            next_btn.scroll_into_view_if_needed(timeout=5000)
-            next_btn.click(timeout=8000)
-        except Exception:                             # noqa: BLE001
-            break                                     # pager gone: done
-        if not _wait_page_turn(driver.page, before, before_first):
-            print("[scan] page did not advance after Next -- "
-                  "stopping there", flush=True)
+
+        # Persistent Next click: 3x back-to-back, wait, another 3x
+        advanced = _click_next_with_retry(
+            driver.page, before, before_first, page_idx=page_idx)
+        if not advanced:
             break
+
     out: list = []
     for raw_rows in pages:
         for raw in raw_rows:

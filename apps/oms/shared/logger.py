@@ -18,7 +18,7 @@ def get_logger(name: str, log_dir: Optional[str] = None) -> logging.Logger:
     that inherit those handlers automatically.
 
     Usage in any OMS module:
-        from app.oms.shared.logger import get_logger
+        from apps.oms.shared.logger import get_logger
         log = get_logger(__name__)
         log.info("Order received")
         log.warning("Duplicate detected")

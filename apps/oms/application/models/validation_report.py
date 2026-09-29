@@ -66,7 +66,7 @@ class ValidationReport:
 
         Called by ValidationEngine after all validators complete.
         '''
-        from app.oms.application.models.validation_error import ErrorSeverity
+        from apps.oms.application.models.validation_error import ErrorSeverity
 
         # is_valid: True only if no CRITICAL errors
         critical_errors = [

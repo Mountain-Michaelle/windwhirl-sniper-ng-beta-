@@ -37,6 +37,16 @@ Two deliberate, documented caveats:
     consecutive wait calls on the same element can never inherit each
     other's "already stable since ..." state -- each call observes its
     own stability window from scratch, exactly like the original loops.
+
+MEASUREMENT (Phase 0): every public helper below is wrapped in
+@profiled(<name>), so wait_profile reports how long each wait actually
+costs on a real run, and each _py_* fallback is tagged "fallback.<name>"
+so a run that is silently falling back to Python polling (and paying a
+Playwright round trip per iteration) is visible in the output. The
+wrapper is transparent -- same args, same return value, same exceptions
+-- and the accounting is OPT-IN: it is off on a normal run, WW_WAIT_PROFILE=1
+turns it on for one run, and run_upload.py's --enable-diagnostics turns it on
+together with Playwright tracing. WW_WAIT_PROFILE=0 forces it off.
 """
 
 from __future__ import annotations
@@ -46,6 +56,8 @@ import time
 from typing import Optional
 
 from playwright.sync_api import TimeoutError as PWTimeoutError
+
+from apps.sniper.product_upload.wait_profile import profiled
 
 _TOKENS = itertools.count()
 
@@ -88,6 +100,7 @@ def _dispose(handle) -> None:
 # Public helpers -- each mirrors one original polling loop.
 # ---------------------------------------------------------------------------
 
+@profiled("wait_value_equals")
 def wait_value_equals(locator, expected: str, timeout_ms: int,
                       min_stable_ms: int = 40, poll_ms: int = 15) -> tuple[bool, str]:
     """Waits until the element's value equals `expected` (returns
@@ -137,6 +150,7 @@ def wait_value_equals(locator, expected: str, timeout_ms: int,
         _dispose(handle)
 
 
+@profiled("wait_value_stable")
 def wait_value_stable(locator, timeout_ms: int,
                       min_stable_ms: int = 35, poll_ms: int = 15) -> str:
     """Waits until the element's value has held steady for min_stable_ms
@@ -181,6 +195,7 @@ def wait_value_stable(locator, timeout_ms: int,
         _dispose(handle)
 
 
+@profiled("wait_enabled_stable")
 def wait_enabled_stable(locator, timeout_ms: int,
                         min_stable_ms: int = 30, poll_ms: int = 15) -> None:
     """Waits until the element reads as enabled (no `disabled` attribute,
@@ -223,6 +238,7 @@ def wait_enabled_stable(locator, timeout_ms: int,
         _dispose(handle)
 
 
+@profiled("wait_enabled_now")
 def wait_enabled_now(locator, timeout_ms: int) -> None:
     """Waits until the element reads as enabled at all (no stability
     requirement -- the original _click_next loop broke on the FIRST enabled
@@ -253,6 +269,7 @@ def wait_enabled_now(locator, timeout_ms: int) -> None:
         _dispose(handle)
 
 
+@profiled("wait_count_stable")
 def wait_count_stable(scope, child_selector: str, timeout_ms: int,
                       min_stable_ms: int = 50, poll_ms: int = 25) -> Optional[int]:
     """Waits until the number of `child_selector` descendants of `scope`
@@ -299,6 +316,7 @@ def wait_count_stable(scope, child_selector: str, timeout_ms: int,
         _dispose(handle)
 
 
+@profiled("wait_text_matches")
 def wait_text_matches(locator, value: str, match_mode: str,
                       timeout_ms: int, poll_ms: int = 15) -> bool:
     """Waits until the element's rendered text matches `value` the same way
@@ -334,6 +352,7 @@ def wait_text_matches(locator, value: str, match_mode: str,
         _dispose(handle)
 
 
+@profiled("wait_box_stable")
 def wait_box_stable(locator, timeout_ms: int,
                     min_stable_ms: int = 60, poll_ms: int = 30) -> None:
     """Waits until the element's bounding box has held steady for
@@ -373,6 +392,7 @@ def wait_box_stable(locator, timeout_ms: int,
         _dispose(handle)
 
 
+@profiled("wait_value_shorter")
 def wait_value_shorter(locator, prev_len: int, timeout_ms: int,
                        poll_ms: int = 15) -> None:
     """Waits until the element's value is strictly shorter than prev_len
@@ -404,6 +424,7 @@ def wait_value_shorter(locator, prev_len: int, timeout_ms: int,
 # only when the in-page path fails for any reason.
 # ---------------------------------------------------------------------------
 
+@profiled("fallback.wait_value_equals")
 def _py_wait_value_equals(locator, expected: str, timeout_ms: int, poll_ms: int) -> tuple[bool, str]:
     deadline = time.time() + timeout_ms / 1000
     try:
@@ -434,6 +455,7 @@ def _py_wait_value_equals(locator, expected: str, timeout_ms: int, poll_ms: int)
     return False, prev
 
 
+@profiled("fallback.wait_value_stable")
 def _py_wait_value_stable(locator, timeout_ms: int, poll_ms: int) -> str:
     deadline = time.time() + timeout_ms / 1000
     try:
@@ -457,6 +479,7 @@ def _py_wait_value_stable(locator, timeout_ms: int, poll_ms: int) -> str:
     return prev
 
 
+@profiled("fallback.wait_enabled_stable")
 def _py_wait_enabled_stable(locator, timeout_ms: int, poll_ms: int) -> None:
     deadline = time.time() + timeout_ms / 1000
     stable_reads = 0
@@ -476,6 +499,7 @@ def _py_wait_enabled_stable(locator, timeout_ms: int, poll_ms: int) -> None:
         time.sleep(poll_ms / 1000)
 
 
+@profiled("fallback.wait_count_stable")
 def _py_wait_count_stable(scope, child_selector: str, timeout_ms: int, poll_ms: int) -> None:
     deadline = time.time() + timeout_ms / 1000
     try:
@@ -498,6 +522,7 @@ def _py_wait_count_stable(scope, child_selector: str, timeout_ms: int, poll_ms: 
             prev = cur
 
 
+@profiled("fallback.wait_text_matches")
 def _py_wait_text_matches(locator, value_norm: str, match_mode: str,
                           timeout_ms: int, poll_ms: int) -> bool:
     deadline = time.time() + timeout_ms / 1000
@@ -516,6 +541,7 @@ def _py_wait_text_matches(locator, value_norm: str, match_mode: str,
     return False
 
 
+@profiled("fallback.wait_box_stable")
 def _py_wait_box_stable(locator, timeout_ms: int, poll_ms: int) -> None:
     deadline = time.time() + timeout_ms / 1000
     try:
@@ -538,6 +564,7 @@ def _py_wait_box_stable(locator, timeout_ms: int, poll_ms: int) -> None:
             prev = cur
 
 
+@profiled("fallback.wait_value_shorter")
 def _py_wait_value_shorter(locator, prev_len: int, timeout_ms: int, poll_ms: int) -> None:
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:

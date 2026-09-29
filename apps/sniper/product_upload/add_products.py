@@ -133,6 +133,15 @@ class AutomationConfig:
     enable_closure_diagnostics: bool = True
     diagnostics_dir: str = "recordings/closure_diagnostics"
 
+    # PERF (Sep 2026, "a long --enable-diagnostics run must not grow in RAM"):
+    # while Playwright tracing IS running, the open trace chunk is rotated
+    # (flushed to a small two-slot window file) every N order attempts rather
+    # than buffering every snapshot/screenshot of a 200+ order run in memory
+    # until the browser closes. 0 disables rotation. Only ever consulted while
+    # tracing is actually active, so a normal run pays nothing for it -- see
+    # closure_diagnostics.maybe_rotate_trace_chunk.
+    trace_chunk_rotate_orders: int = 25
+
     error_selectors: tuple[str, ...] = (
         '[role="alert"]',
         ".text-destructive",
@@ -262,6 +271,35 @@ def _resolve_price_decision(match: MatchResult, excel_price, options: list, inde
     return decision, price_matched_exactly
 
 
+def _require_selectable_price_option(decision, match: MatchResult, index: int,
+                                    suffix: str = "") -> Optional[str]:
+    """Return an error string if this decision has nothing selectable.
+
+    decide_price_offer has two degenerate branches that produce
+    option_data_value="" (an unparseable Excel price, and a dropdown whose
+    options carried no parseable price). _resolve_price_decision keeps that
+    empty value -- there is genuinely no option to pick -- and the callers
+    used to hand "" straight to _select_combobox, which then:
+
+      * retried the click 3x against a value no option can ever equal,
+      * reported "clicked a matching option for value='' ... but the
+        combobox never displayed it", and
+      * returned a reason that matched no PERMANENT_REASON_MARKERS entry,
+        so it was classified TRANSIENT and the whole order was retried
+        (with a cache invalidation and a live re-read each round) until the
+        row stalled the run.
+
+    That is a guaranteed-fail value, so it must fail ONCE and clearly rather
+    than three times per attempt per retry. The wording is deliberately
+    recognisable to is_transient_failure's permanent markers.
+    """
+    if decision.option_data_value:
+        return None
+    return (f"'{match.matched_product}' (line {index + 1}){suffix}: "
+            f"refusing to open the price dropdown for an empty value -- "
+            f"no selectable price option was resolved ({decision.reason})")
+
+
 def _select_product_and_price(dialog, page, index: int, match: MatchResult,
                                excel_price, cfg: AutomationConfig, state: "_ComboState",
                                row_number: Optional[int] = None):
@@ -316,6 +354,10 @@ def _select_product_and_price(dialog, page, index: int, match: MatchResult,
 
         decision, price_matched_exactly = _resolve_price_decision(match, excel_price, options, index, cfg)
 
+        guard = _require_selectable_price_option(decision, match, index)
+        if guard:
+            return guard
+
         err = _select_combobox(dialog, page, price_combo, decision.option_data_value, cfg,
                                 f"price offer for '{match.matched_product}' (line {index + 1})", state,
                                 row_number=row_number)
@@ -346,6 +388,10 @@ def _select_product_and_price(dialog, page, index: int, match: MatchResult,
                         f"price-offer dropdown after cache invalidation")
             cfg.price_options_cache[cache_key] = options
             decision, price_matched_exactly = _resolve_price_decision(match, excel_price, options, index, cfg)
+            guard = _require_selectable_price_option(
+                decision, match, index, suffix=", post-cache-invalidation retry")
+            if guard:
+                return guard
             err = _select_combobox(dialog, page, price_combo, decision.option_data_value, cfg,
                                     f"price offer for '{match.matched_product}' (line {index + 1}, "
                                     f"post-cache-invalidation retry)", state, row_number=row_number)
@@ -391,6 +437,10 @@ def _select_product_and_price(dialog, page, index: int, match: MatchResult,
 
     decision, price_matched_exactly = _resolve_price_decision(match, excel_price, matching, index, cfg)
 
+    guard = _require_selectable_price_option(decision, match, index)
+    if guard:
+        return guard
+
     err = _select_combobox(dialog, page, combo, decision.option_data_value, cfg,
                             f"product+price offer for '{match.matched_product}' (line {index + 1})", state,
                             row_number=row_number)
@@ -417,6 +467,10 @@ def _select_product_and_price(dialog, page, index: int, match: MatchResult,
             return (f"'{match.matched_product}': no option in the product dropdown's "
                     f"{len(all_options)} option(s) matched this product name, after cache invalidation")
         decision, price_matched_exactly = _resolve_price_decision(match, excel_price, matching, index, cfg)
+        guard = _require_selectable_price_option(
+            decision, match, index, suffix=", post-cache-invalidation retry")
+        if guard:
+            return guard
         err = _select_combobox(dialog, page, combo, decision.option_data_value, cfg,
                                 f"product+price offer for '{match.matched_product}' (line {index + 1}, "
                                 f"post-cache-invalidation retry)", state, row_number=row_number)
@@ -658,6 +712,18 @@ def process_order(page, order: dict, cfg: AutomationConfig,
         timings[label] = round((now - t_phase) * 1000, 1)
         t_phase = now
 
+    def _sub(label: str, started: float) -> None:
+        """PERF (Phase 0): accumulate a SUB-phase into timings under a
+        distinct "<phase>.<step>" key without moving the t_phase checkpoint.
+        The three original coarse phases keep their exact values (and keep
+        tiling the order exactly, so total_ms still reconciles), while each
+        big phase is now broken down into the steps that actually cost
+        time. Phase 0's whole purpose is to find WHICH step dominates, and
+        a single "product_lines_ms" average cannot answer that.
+        """
+        timings[label] = round(timings.get(label, 0.0)
+                               + (time.perf_counter() - started) * 1000, 1)
+
     if plan is not None:
         # Planning already ran parse_order_products()/infer_state() once,
         # up front, with no browser involved -- PlanningError would have
@@ -718,9 +784,11 @@ def process_order(page, order: dict, cfg: AutomationConfig,
             # so any tracked trigger from the previous (now-gone) dialog
             # must not carry over.
             combo_state = _ComboState()
+            _t_attempt = time.perf_counter()
             dialog, err, matched_names, dialog_closed = _fill_products_screen(
                 page, matches, order, cfg, combo_state, row_number=row_number
             )
+            _sub("products_screen_ms", _t_attempt)
             if dialog is not None:
                 break
             if not dialog_closed or attempt == cfg.dialog_reopen_retries:
@@ -736,7 +804,9 @@ def process_order(page, order: dict, cfg: AutomationConfig,
                                 timings_ms=timings)
         _mark_phase("product_lines_ms")
 
+        _t = time.perf_counter()
         err = _click_next(dialog, page, cfg, "Products -> Charges", row_number=row_number)
+        _sub("next_transitions_ms", _t)
         if err:
             timings["total_ms"] = _elapsed_ms()
             return OrderResult(False, row_number, reason=err, matched_products=matched_names,
@@ -747,9 +817,11 @@ def process_order(page, order: dict, cfg: AutomationConfig,
             return OrderResult(False, row_number, reason=guard_err, matched_products=matched_names,
                                 timings_ms=timings)
 
+        _t = time.perf_counter()
         err = _select_combobox(dialog, page, dialog.locator(sel.combo_trigger(sel.PAYMENT_METHOD_LABEL)),
                                 sel.PAYMENT_METHOD_VALUE, cfg, "payment method", combo_state,
                                 row_number=row_number)
+        _sub("combobox_ms", _t)
         if err:
             timings["total_ms"] = _elapsed_ms()
             return OrderResult(False, row_number, reason=err, matched_products=matched_names,
@@ -760,9 +832,11 @@ def process_order(page, order: dict, cfg: AutomationConfig,
             return OrderResult(False, row_number, reason=guard_err, matched_products=matched_names,
                                 timings_ms=timings)
 
+        _t = time.perf_counter()
         err = _select_combobox(dialog, page, dialog.locator(sel.combo_trigger(sel.ORDER_SOURCE_LABEL)),
                                 sel.ORDER_SOURCE_VALUE, cfg, "order source", combo_state,
                                 row_number=row_number)
+        _sub("combobox_ms", _t)
         if err:
             timings["total_ms"] = _elapsed_ms()
             return OrderResult(False, row_number, reason=err, matched_products=matched_names,
@@ -773,7 +847,9 @@ def process_order(page, order: dict, cfg: AutomationConfig,
             return OrderResult(False, row_number, reason=guard_err, matched_products=matched_names,
                                 timings_ms=timings)
 
+        _t = time.perf_counter()
         err = _click_next(dialog, page, cfg, "Charges -> Customer", row_number=row_number)
+        _sub("next_transitions_ms", _t)
         if err:
             timings["total_ms"] = _elapsed_ms()
             return OrderResult(False, row_number, reason=err, matched_products=matched_names,
@@ -791,7 +867,9 @@ def process_order(page, order: dict, cfg: AutomationConfig,
         # wasted attempts -> transient failure -> cleanup closes the modal ->
         # identical retry). Every other field is untouched; without a plan
         # this is just `order`.
+        _t = time.perf_counter()
         err = _fill_customer_info(dialog, _fill_order_for_plan(order, plan), cfg)
+        _sub("customer_info_ms", _t)
         if err:
             timings["total_ms"] = _elapsed_ms()
             return OrderResult(False, row_number, reason=err, matched_products=matched_names,
@@ -802,9 +880,11 @@ def process_order(page, order: dict, cfg: AutomationConfig,
         # confirm + post-selection guard all avoided) and go straight to
         # the next step -- the form saves fine without a state.
         if state is not None:
+            _t = time.perf_counter()
             err = _select_combobox(dialog, page, dialog.locator(sel.combo_trigger(sel.STATE_LABEL)),
                                     state, cfg, "state", combo_state, match_mode="contains",
                                     row_number=row_number)
+            _sub("combobox_ms", _t)
             if err:
                 timings["total_ms"] = _elapsed_ms()
                 return OrderResult(False, row_number, reason=err, matched_products=matched_names,
@@ -815,7 +895,9 @@ def process_order(page, order: dict, cfg: AutomationConfig,
                 return OrderResult(False, row_number, reason=guard_err, matched_products=matched_names,
                                     timings_ms=timings)
 
+        _t = time.perf_counter()
         err = _click_next(dialog, page, cfg, "Customer -> Summary", row_number=row_number)
+        _sub("next_transitions_ms", _t)
         if err:
             timings["total_ms"] = _elapsed_ms()
             return OrderResult(False, row_number, reason=err, matched_products=matched_names,
@@ -827,12 +909,15 @@ def process_order(page, order: dict, cfg: AutomationConfig,
                                 timings_ms=timings)
 
         _mark_phase("charges_and_customer_ms")
+        _t = time.perf_counter()
         err = _click_final_submit(dialog, cfg)
+        _sub("final_submit_click_ms", _t)
         if err:
             timings["total_ms"] = _elapsed_ms()
             return OrderResult(False, row_number, reason=err, matched_products=matched_names,
                                 timings_ms=timings)
 
+        _t = time.perf_counter()
         outcome, reason = detect_save_outcome(dialog, cfg)
         retries_left = cfg.max_retries_on_inconclusive
         while outcome == "inconclusive" and retries_left > 0:
@@ -844,6 +929,7 @@ def process_order(page, order: dict, cfg: AutomationConfig,
             # useful to wait for here that a fixed sleep would add.
             outcome, reason = detect_save_outcome(dialog, cfg)
             retries_left -= 1
+        _sub("save_detection_ms", _t)
 
         flagged = [m for m in matches if m.needs_manual_review]
 
