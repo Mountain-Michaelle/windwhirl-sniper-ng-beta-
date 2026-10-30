@@ -1,8 +1,0 @@
-client_id: client_jane_f6bf8065
-name_key: jane
-display_name: jane
-created_at: "2026-09-22T04:52:29Z"
-enabled: true
-credential_reference: env:JANE_F6BF8065
-# Configure crm_account_id before uploading.
-crm_account_id: client_jane_f6bf8065

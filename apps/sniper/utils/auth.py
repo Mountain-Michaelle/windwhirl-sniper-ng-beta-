@@ -179,7 +179,7 @@ def _fill_resilient(page, primary: str, fallback: str, value: str, label: str,
 
 
 def login(page, login_url: str, target_url: str, logged_in_selector: str,
-          network_wait_timeout_ms: int = 20000,
+          network_wait_timeout_ms: int = 80000,
           client_id: str | None = None,
           credential_reference: str | None = None,
           env_file: str | None = None,

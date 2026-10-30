@@ -1,0 +1,8 @@
+client_id: client_jane_97a9624c
+name_key: jane
+display_name: jane
+created_at: "2026-10-29T19:51:49Z"
+enabled: true
+credential_reference: env:JANE_97A9624C
+# Configure crm_account_id before uploading.
+crm_account_id: client_jane_97a9624c
