@@ -176,6 +176,25 @@ from apps.sniper.client_scheduler import ClientProcessScheduler, ScheduledJob
 from apps.sniper.conditional_wait import poll_until
 from apps.sniper.work_queue import OrderClaimQueue
 
+# Production-mode imports (lazy-loaded only when --production is used).
+# Keeping these separate from the core imports means local execution does
+# NOT require libsql, gspread, or google-auth to be installed.
+_PRODUCTION_TRACKER = None
+_SHEETS_ADAPTER = None
+
+
+def _import_production_modules():
+    """Import production-only modules on first use. Raises ImportError with
+    a clear message if the required packages are not installed."""
+    global _PRODUCTION_TRACKER, _SHEETS_ADAPTER
+    if _PRODUCTION_TRACKER is None:
+        from apps.sniper.production_tracker import ProductionTracker, production_order_key
+        _PRODUCTION_TRACKER = (ProductionTracker, production_order_key)
+    if _SHEETS_ADAPTER is None:
+        from apps.sniper.sheets_adapter import load_orders_from_sheets
+        _SHEETS_ADAPTER = load_orders_from_sheets
+    return _PRODUCTION_TRACKER, _SHEETS_ADAPTER
+
 # ==============================================================================
 LOGIN_URL = "https://sniper.ng/login"
 TARGET_URL = "https://sniper.ng/orders"
@@ -956,19 +975,34 @@ def _attempt_order(page, cfg, order: dict, row_number, progress: ProgressTracker
                     failed_rows: list[FailedOrder], counters: dict,
                     flagged_rows: list[FlaggedForReview],
                     plan: ExecutionPlan | None = None,
-                    lock_mode: bool = False) -> bool:
+                    lock_mode: bool = False,
+                    production: bool = False,
+                    client: str | None = None) -> bool:
     # PERF/DIAGNOSTICS (Sep 2026): keep a long --enable-diagnostics run's
     # trace bounded. A no-op on a normal run -- the rotator is only armed when
     # tracing actually started -- so this costs one dict lookup per order.
     maybe_rotate_trace_chunk(page, cfg, row_number)
 
-    if progress.is_done(order) or job_progress.is_done(order):
-        counters["skipped_duplicate"] = counters.get("skipped_duplicate", 0) + 1
-        retry_cache.remove(order)
-        failed_ledger.remove(order)
-        print(f"    SKIP -- already succeeded earlier this run/a previous run "
-              f"(same customer+phone+product+price fingerprint) -- not resubmitting", flush=True)
-        return True
+    # Production mode: is_done() takes an order_key string, not an order dict.
+    # Local mode: is_done() takes an order dict and computes the key internally.
+    if production:
+        from apps.sniper.production_tracker import production_order_key as _prod_key_fn
+        _pk = _prod_key_fn(client, order)
+        if progress.is_done(_pk):
+            counters["skipped_duplicate"] = counters.get("skipped_duplicate", 0) + 1
+            retry_cache.remove_key(_pk)
+            failed_ledger.remove_key(_pk)
+            print(f"    SKIP -- already succeeded earlier this run/a previous run "
+                  f"(same customer+phone+product+price fingerprint) -- not resubmitting", flush=True)
+            return True
+    else:
+        if progress.is_done(order) or job_progress.is_done(order):
+            counters["skipped_duplicate"] = counters.get("skipped_duplicate", 0) + 1
+            retry_cache.remove(order)
+            failed_ledger.remove(order)
+            print(f"    SKIP -- already succeeded earlier this run/a previous run "
+                  f"(same customer+phone+product+price fingerprint) -- not resubmitting", flush=True)
+            return True
 
     consecutive_failures = 0
     while True:
@@ -1018,10 +1052,20 @@ def _attempt_order(page, cfg, order: dict, row_number, progress: ProgressTracker
 
     if result.success:
         counters["succeeded"] += 1
-        progress.mark_done(order)
-        job_progress.mark_done(order)
-        retry_cache.remove(order)
-        failed_ledger.remove(order)
+        # Production mode: mark_done takes (order_key, order) with client-scoped key.
+        # Local mode: mark_done takes (order) and computes key internally.
+        if production:
+            from apps.sniper.production_tracker import production_order_key as _prod_key_fn
+            _pk = _prod_key_fn(client, order)
+            progress.mark_done(_pk, order)
+            retry_cache.remove_key(_pk)
+            failed_ledger.remove_key(_pk)
+        else:
+            progress.mark_done(order)
+            # job_progress only exists in local mode (single shared progress.db)
+            job_progress.mark_done(order)
+            retry_cache.remove(order)
+            failed_ledger.remove(order)
         print(f"    OK   -- matched: {result.matched_products} | {result.reason}", flush=True)
         if result.needs_manual_review:
             counters["flagged_for_review"] = counters.get("flagged_for_review", 0) + 1
@@ -1454,7 +1498,8 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                   failure_log: FailureLogger, counters: dict,
                   failed_rows: list[FailedOrder], flagged_rows: list[FlaggedForReview],
                   refresh_catalog: bool = False, enable_tracing: bool = False,
-                  claim_queue: Optional[OrderClaimQueue] = None) -> None:
+                  claim_queue: Optional[OrderClaimQueue] = None,
+                    production: bool = False, client: str | None = None) -> None:
     """One full attempt at a browser session: launch, log in, load the
     catalog, walk every order. Raises on anything it can't recover from
     locally (a real browser/network failure, an unhandled Playwright
@@ -1831,45 +1876,86 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
          enable_tracing: bool = False, client: str | None = None,
          source: str | None = None, job: str | None = None,
          dry_run: bool = False, skip_done: bool = True,
-         workers: int = 1, shard: tuple[int, int] | None = None) -> None:
+         workers: int = 1, shard: tuple[int, int] | None = None,
+         production: bool = False, source_type: str = "excel") -> None:
     global AUTH_STORAGE_PATH
-    if client:
-        manager = WorkspaceManager()
-        if job:
-            workspace = manager.workspace(client, job)
-        else:
-            input_path = Path(source) if source else None
-            if input_path is None:
-                raise ValueError("--source is required when creating a new client job")
-            # Explicit sources are copied into the immutable job envelope.
-            inbox_copy = manager.root / "_inbox" / (
-                f".{client}_{os.getpid()}_{time.time_ns()}{input_path.suffix.lower()}"
+
+    # --- Production mode: Turso backend, Google Sheets source ----------------
+    if production:
+        ProductionTrackerCls, production_order_key_fn = _import_production_modules()[0:2]
+        turso_url = os.environ.get("TURSO_URL", "")
+        turso_auth = os.environ.get("TURSO_AUTH", "")
+        if not turso_url or not turso_auth:
+            raise RuntimeError(
+                "Production mode requires TURSO_URL and TURSO_AUTH environment "
+                "variables. Neither may be empty. Refusing to fall back to "
+                "local SQLite."
             )
-            inbox_copy.parent.mkdir(parents=True, exist_ok=True)
-            import shutil
-            shutil.copy2(input_path, inbox_copy)
-            workspace = manager.import_inbox(inbox_copy, client_id=client)
-        _configure_workspace(workspace)
-        if shard is not None:
-            AUTH_STORAGE_PATH = _seed_shard_auth_storage(workspace, shard)
-        print(f"Client: {workspace.client_id}  Job: {workspace.job_id}")
-        # A job holds every file appended by earlier init runs, so the whole
-        # set is the work, not just the newest workbook. Reading only
-        # source_path silently dropped every previously imported order.
-        source_files = tuple(workspace.source_paths) or (workspace.source_path,)
-        for _i, _p in enumerate(source_files, start=1):
-            if len(source_files) == 1:
-                print(f"Immutable source: {_p}")
-            else:
-                print(f"Immutable source {_i}/{len(source_files)}: {_p}")
-        orders = load_orders_from_all(source_files)
-        print(f"Loaded {len(orders)} order(s) from "
-              f"{len(source_files)} file(s)")
+        if not client:
+            raise RuntimeError("Production mode requires --client <client_id>.")
+        tracker = ProductionTrackerCls(
+            client_id=client, url=turso_url, auth_token=turso_auth
+        )
+        retry_cache = ProductionRetryCache(tracker)
+        failed_ledger = ProductionFailedLedger(tracker)
+
+        if source_type == "sheets":
+            load_orders_from_sheets = _import_production_modules()[2]
+            worksheet_name = os.environ.get("GOOGLE_SHEETS_WORKSHEET_NAME", None)
+            orders = load_orders_from_sheets(
+                spreadsheet_id=source or "",
+                worksheet_name=worksheet_name or None,
+            )
+            print(f"Loaded {len(orders)} order(s) from Google Sheet "
+                  f"(spreadsheet_id={source[:8]}...)")
+        else:
+            raise ValueError(
+                f"source_type={source_type!r} is not supported in production mode. "
+                f"Use 'sheets'."
+            )
+    # --- Local mode: existing SQLite + JSON tracking + Excel source ----------
     else:
-        # Legacy single-client layout remains fully supported.
-        orders_path = Path(source) if source else find_orders_file()
-        orders = load_orders(str(orders_path))
-        print(f"Loaded {len(orders)} order(s) from {orders_path}")
+        tracker = None
+        retry_cache = None
+        failed_ledger = None
+
+        if client:
+            manager = WorkspaceManager()
+            if job:
+                workspace = manager.workspace(client, job)
+            else:
+                input_path = Path(source) if source else None
+                if input_path is None:
+                    raise ValueError("--source is required when creating a new client job")
+                # Explicit sources are copied into the immutable job envelope.
+                inbox_copy = manager.root / "_inbox" / (
+                    f".{client}_{os.getpid()}_{time.time_ns()}{input_path.suffix.lower()}"
+                )
+                inbox_copy.parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copy2(input_path, inbox_copy)
+                workspace = manager.import_inbox(inbox_copy, client_id=client)
+            _configure_workspace(workspace)
+            if shard is not None:
+                AUTH_STORAGE_PATH = _seed_shard_auth_storage(workspace, shard)
+            print(f"Client: {workspace.client_id}  Job: {workspace.job_id}")
+            # A job holds every file appended by earlier init runs, so the whole
+            # set is the work, not just the newest workbook. Reading only
+            # source_path silently dropped every previously imported order.
+            source_files = tuple(workspace.source_paths) or (workspace.source_path,)
+            for _i, _p in enumerate(source_files, start=1):
+                if len(source_files) == 1:
+                    print(f"Immutable source: {_p}")
+                else:
+                    print(f"Immutable source {_i}/{len(source_files)}: {_p}")
+            orders = load_orders_from_all(source_files)
+            print(f"Loaded {len(orders)} order(s) from "
+                  f"{len(source_files)} file(s)")
+        else:
+            # Legacy single-client layout remains fully supported.
+            orders_path = Path(source) if source else find_orders_file()
+            orders = load_orders(str(orders_path))
+            print(f"Loaded {len(orders)} order(s) from {orders_path}")
 
     print(f"[run] diagnostics={'on' if enable_tracing else 'off'}  "
           f"--workers={workers}  "
@@ -1902,46 +1988,62 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
         print(f"Dry run: validated {len(orders)} order(s); no browser or uploads started.")
         return {}
 
-    progress_path = (
-        ACTIVE_WORKSPACE.client_progress_db
-        if ACTIVE_WORKSPACE else PROGRESS_DIR / "progress.db"
-    )
-    progress = ProgressTracker(path=str(progress_path))
-    job_progress = ProgressTracker(path=str(PROGRESS_DIR / "progress.db"))
-    # One-way, idempotent compatibility bridge for the former layout.
-    legacy_progress = PROGRESS_DIR / "processed_orders.json"
-    if not progress.count and legacy_progress.exists():
-        imported = progress.import_from_json_backup(str(legacy_progress))
-        if imported:
-            print(f"[migration] imported {imported} legacy progress key(s) safely.")
-    # PERF (--workers sharding): a shard worker owns its own queue file
-    # so two workers can never attempt the same queued order
-    # concurrently; the parent merges every shard file back into the
-    # main persistent queue when the workers exit. A parent (shard=None)
-    # also recovers shard files orphaned by a crashed previous run.
-    if shard is not None:
-        shard_queue_path = _shard_queue_path(PROGRESS_DIR, shard[0], shard[1])
+    # Production mode: use the Turso-backed tracker that was already
+    # instantiated above. No local SQLite files are created or touched.
+    if production:
+        progress = tracker
+        retry_cache = retry_cache
+        failed_ledger = failed_ledger
     else:
-        shard_queue_path = PROGRESS_DIR / "retry_queue.json"
-        merged_orphans = collect_and_merge_shard_queues(
-            PROGRESS_DIR, PROGRESS_DIR / "retry_queue.json")
-        if merged_orphans:
-            print(f"[shard] merged {merged_orphans} leftover shard queue "
-                  f"file(s) from a previous run into the main retry queue.")
-    retry_cache = RetryCache(path=str(shard_queue_path))
-    if shard is not None:
-        shard_ledger_path = _shard_ledger_path(PROGRESS_DIR, shard[0], shard[1])
-    else:
-        shard_ledger_path = PROGRESS_DIR / "failed_orders.json"
-        merged_orphan_ledgers = collect_and_merge_shard_ledgers(
-            PROGRESS_DIR, PROGRESS_DIR / "failed_orders.json")
-        if merged_orphan_ledgers:
-            print(f"[shard] merged {merged_orphan_ledgers} leftover shard "
-                  f"failed-ledger file(s) from a previous run into the main ledger.")
-    failed_ledger = FailedLedger(path=str(shard_ledger_path))
+        progress_path = (
+            ACTIVE_WORKSPACE.client_progress_db
+            if ACTIVE_WORKSPACE else PROGRESS_DIR / "progress.db"
+        )
+        progress = ProgressTracker(path=str(progress_path))
+        job_progress = ProgressTracker(path=str(PROGRESS_DIR / "progress.db"))
+        # One-way, idempotent compatibility bridge for the former layout.
+        legacy_progress = PROGRESS_DIR / "processed_orders.json"
+        if not progress.count and legacy_progress.exists():
+            imported = progress.import_from_json_backup(str(legacy_progress))
+            if imported:
+                print(f"[migration] imported {imported} legacy progress key(s) safely.")
+        # PERF (--workers sharding): a shard worker owns its own queue file
+        # so two workers can never attempt the same queued order
+        # concurrently; the parent merges every shard file back into the
+        # main persistent queue when the workers exit. A parent (shard=None)
+        # also recovers shard files orphaned by a crashed previous run.
+        if shard is not None:
+            shard_queue_path = _shard_queue_path(PROGRESS_DIR, shard[0], shard[1])
+        else:
+            shard_queue_path = PROGRESS_DIR / "retry_queue.json"
+            merged_orphans = collect_and_merge_shard_queues(
+                PROGRESS_DIR, PROGRESS_DIR / "retry_queue.json")
+            if merged_orphans:
+                print(f"[shard] merged {merged_orphans} leftover shard queue "
+                      f"file(s) from a previous run into the main retry queue.")
+        retry_cache = RetryCache(path=str(shard_queue_path))
+        if shard is not None:
+            shard_ledger_path = _shard_ledger_path(PROGRESS_DIR, shard[0], shard[1])
+        else:
+            shard_ledger_path = PROGRESS_DIR / "failed_orders.json"
+            merged_orphan_ledgers = collect_and_merge_shard_ledgers(
+                PROGRESS_DIR, PROGRESS_DIR / "failed_orders.json")
+            if merged_orphan_ledgers:
+                print(f"[shard] merged {merged_orphan_ledgers} leftover shard "
+                      f"failed-ledger file(s) from a previous run into the main ledger.")
+        failed_ledger = FailedLedger(path=str(shard_ledger_path))
 
 
-    already_done_count = sum(1 for o in orders if progress.is_done(o))
+    # Production mode: is_done() takes an order_key string, not an order dict.
+    # Local mode: is_done() takes an order dict and computes the key internally.
+    if production:
+        _, production_order_key_fn = _import_production_modules()[0], None
+        from apps.sniper.production_tracker import production_order_key as prod_key_fn
+        already_done_count = sum(
+            1 for o in orders if progress.is_done(prod_key_fn(client, o))
+        )
+    else:
+        already_done_count = sum(1 for o in orders if progress.is_done(o))
     if already_done_count:
         print(f"{already_done_count} order(s) already marked done in a previous run "
               f"({progress.count} total tracked as done) -- will be skipped automatically.")
@@ -2024,7 +2126,8 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
                              failed_ledger, failure_log,
                              counters, failed_rows, flagged_rows,
                              refresh_catalog=effective_refresh_catalog,
-                             enable_tracing=enable_tracing, claim_queue=claim_queue)
+                             enable_tracing=enable_tracing, claim_queue=claim_queue,
+                             production=production, client=client)
                 break
             except KeyboardInterrupt:
                 raise
@@ -2050,7 +2153,8 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
             _run_session(lock_mode, orders, progress, job_progress, retry_cache,
                          failed_ledger, failure_log,
                          counters, failed_rows, flagged_rows, refresh_catalog=refresh_catalog,
-                         enable_tracing=enable_tracing, claim_queue=claim_queue)
+                         enable_tracing=enable_tracing, claim_queue=claim_queue,
+                         production=production, client=client)
         except MissingCredentialsError as e:
             print(f"ERROR: {e}")
             sys.exit(1)
@@ -2183,7 +2287,8 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
          skip: tuple[str, ...] = (),
          workers: int = 1, shard: tuple[int, int] | None = None,
          max_parallel: int = 2, auto_scale_workers: bool = False,
-         housekeeping_only: bool = False) -> None:
+         housekeeping_only: bool = False,
+         production: bool = False, source_type: str = "excel") -> None:
     """Run one explicit job or drain the inbox with bounded client concurrency.
 
     The upload engine is intentionally invoked once per workspace. A completed
@@ -2202,7 +2307,8 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             # rows, then exit. No locks, no status writes, no cleanup.
             _run_upload(lock_mode, refresh_catalog, enable_tracing,
                         workspace.client_id, None, workspace.job_id,
-                        dry_run, skip_done, shard=shard)
+                        dry_run, skip_done, shard=shard,
+                        production=production, client=client)
             return
         try:
             manager.validate_client_ready(workspace.client_id)
@@ -2234,7 +2340,8 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
                     else:
                         counts = _run_upload(lock_mode, refresh_catalog, enable_tracing,
                                              workspace.client_id, None, workspace.job_id,
-                                             dry_run, skip_done, workers=workers)
+                                             dry_run, skip_done, workers=workers,
+                                             production=production, client=client)
             if dry_run:
                 manager.set_job_status(
                     workspace.client_id,
@@ -2360,7 +2467,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             return execute_workspace(workspace, shard=shard)
         return _run_upload(lock_mode, refresh_catalog, enable_tracing, client,
                            source, job, dry_run, skip_done, workers=workers,
-                           shard=shard)
+                           shard=shard, production=production, client=client)
 
     skip_values = {item.lower() for item in skip}
     manager.recover_claimed_files()
@@ -2447,7 +2554,8 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             )
             return
         return _run_upload(lock_mode, refresh_catalog, enable_tracing,
-                           None, None, None, dry_run, skip_done)
+                           None, None, None, dry_run, skip_done,
+                           production=production, client=client)
     workspaces = list(pending_jobs)
     for inbox_file in files:
         claimed_file = manager.claim_inbox_file(inbox_file)
@@ -2686,6 +2794,20 @@ if __name__ == "__main__":
              "(older ones move to jobs\\archive\\superseded with all their state).",
     )
     parser.add_argument("--shard", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help="Run in production mode: shared Turso database + Google Sheets source. "
+             "Requires TURSO_URL, TURSO_AUTH, and GOOGLE_SHEETS_* environment variables. "
+             "Never falls back to local SQLite.",
+    )
+    parser.add_argument(
+        "--source-type",
+        choices=["excel", "sheets"],
+        default="excel",
+        help="Data source type: 'excel' (local CSV/XLSX, default) or "
+             "'sheets' (live Google Sheet, production mode only).",
+    )
     args = parser.parse_args()
     print("[lock] persistent retry mode enabled; press Ctrl+C to stop." if args.lock
           else "[easy] one-pass mode enabled.", flush=True)
@@ -2718,4 +2840,6 @@ if __name__ == "__main__":
          workers=max(1, args.workers), shard=shard,
          max_parallel=args.max_parallel,
          auto_scale_workers=args.auto_scale_workers,
-         housekeeping_only=args.housekeeping_only)
+         housekeeping_only=args.housekeeping_only,
+         production=args.production,
+         source_type=args.source_type)

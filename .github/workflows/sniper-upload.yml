@@ -1,0 +1,157 @@
+name: Sniper Upload Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      client:
+        description: "Client ID to process (e.g. client_jane_97a9624c)"
+        required: true
+        default: "client_jane_97a9624c"
+      source_type:
+        description: "Data source type"
+        required: false
+        default: "sheets"
+        type: choice
+        options:
+          - sheets
+      dry_run:
+        description: "Dry run mode (validate only, no uploads)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      max_parallel:
+        description: "Max concurrent browser sessions"
+        required: false
+        default: "1"
+      target_product:
+        description: "Product filter keyword"
+        required: false
+        default: "sadoer"
+      daily_limit:
+        description: "Max messages per day"
+        required: false
+        default: "50"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sniper-upload-${{ github.workflow }}-${{ inputs.client }}
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    runs-on: windows-latest
+    timeout-minutes: 240
+
+    env:
+      # Client credentials - from GitHub Secrets (never committed)
+      SNIPER_EMAIL: ${{ secrets.SNIPER_EMAIL }}
+      SNIPER_PASSWORD: ${{ secrets.SNIPER_PASSWORD }}
+      # Per-client credentials (named by client-specific prefix)
+      JANE_97A9624C_EMAIL: ${{ secrets.JANE_97A9624C_EMAIL }}
+      JANE_97A9624C_PASSWORD: ${{ secrets.JANE_97A9624C_PASSWORD }}
+      ALEX_FD856E4C_EMAIL: ${{ secrets.ALEX_FD856E4C_EMAIL }}
+      ALEX_FD856E4C_PASSWORD: ${{ secrets.ALEX_FD856E4C_PASSWORD }}
+      CHISOM_7254E7B4_EMAIL: ${{ secrets.CHISOM_7254E7B4_EMAIL }}
+      CHISOM_7254E7B4_PASSWORD: ${{ secrets.CHISOM_7254E7B4_PASSWORD }}
+      EPHRAIM_1CC2C1F4_EMAIL: ${{ secrets.EPHRAIM_1CC2C1F4_EMAIL }}
+      EPHRAIM_1CC2C1F4_PASSWORD: ${{ secrets.EPHRAIM_1CC2C1F4_PASSWORD }}
+      FRANSISCA_28A701DD_EMAIL: ${{ secrets.FRANSISCA_28A701DD_EMAIL }}
+      FRANSISCA_28A701DD_PASSWORD: ${{ secrets.FRANSISCA_28A701DD_PASSWORD }}
+      MICHAEL_0C05E53B_EMAIL: ${{ secrets.MICHAEL_0C05E53B_EMAIL }}
+      MICHAEL_0C05E53B_PASSWORD: ${{ secrets.MICHAEL_0C05E53B_PASSWORD }}
+      PRECIOUS_A492616C_EMAIL: ${{ secrets.PRECIOUS_A492616C_EMAIL }}
+      PRECIOUS_A492616C_PASSWORD: ${{ secrets.PRECIOUS_A492616C_PASSWORD }}
+      VALENTINE_8232C8BD_EMAIL: ${{ secrets.VALENTINE_8232C8BD_EMAIL }}
+      VALENTINE_8232C8BD_PASSWORD: ${{ secrets.VALENTINE_8232C8BD_PASSWORD }}
+
+      # Turso database - shared across all clients
+      TURSO_URL: ${{ secrets.TURSO_URL }}
+      TURSO_AUTH: ${{ secrets.TURSO_AUTH }}
+
+      # Google Sheets
+      GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
+      GOOGLE_SHEETS_WORKSHEET_NAME: ${{ vars.GOOGLE_SHEETS_WORKSHEET_NAME }}
+
+      # Runtime configuration
+      DAILY_LIMIT: ${{ inputs.daily_limit }}
+      TARGET_PRODUCT: ${{ inputs.target_product }}
+      WW_MAX_RETRY_ATTEMPTS: "5"
+
+    steps:
+      - name: Cancel any previous run for this client
+        if: github.event_name == 'workflow_dispatch'
+        uses: styfle/cancel-workflow-action@0.12.0
+        with:
+          access_token: ${{ github.token }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r apps/sniper/requirements.txt
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('apps/sniper/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Validate configuration
+        run: |
+          python -c "
+          import os
+          required = ['SNIPER_EMAIL', 'SNIPER_PASSWORD', 'TURSO_URL', 'TURSO_AUTH',
+                      'GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON', 'GOOGLE_SHEETS_SPREADSHEET_ID']
+          missing = [v for v in required if not os.getenv(v)]
+          if missing:
+              print(f'MISSING REQUIRED ENV VARS: {missing}', flush=True)
+              raise SystemExit(1)
+          print('All required production environment variables are present.', flush=True)
+          "
+
+      - name: Dry run validation (always runs first)
+        if: inputs.dry_run == 'true'
+        run: |
+          cd apps/sniper
+          python run_upload.py --production --source-type sheets \
+            --client ${{ inputs.client }} \
+            --source ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }} \
+            --dry-run \
+            --max-parallel ${{ inputs.max_parallel }} \
+            --target-product ${{ inputs.target_product }}
+
+      - name: Real production upload (requires explicit confirmation)
+        if: inputs.dry_run == 'false'
+        run: |
+          cd apps/sniper
+          python run_upload.py --production --source-type sheets \
+            --client ${{ inputs.client }} \
+            --source ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }} \
+            --max-parallel ${{ inputs.max_parallel }} \
+            --target-product ${{ inputs.target_product }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-logs-${{ github.run_number }}
+          path: |
+            apps/sniper/logs/
+            apps/sniper/reports/
+          retention-days: 1
