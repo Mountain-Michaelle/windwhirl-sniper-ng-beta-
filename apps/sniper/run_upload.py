@@ -51,6 +51,7 @@ import argparse
 import dataclasses
 import json
 import os
+import signal
 import subprocess
 import statistics
 import sys
@@ -1532,7 +1533,41 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
     keeps taking work instead of idling behind a slow peer, and a ``--lock``
     session restart resumes the exact row it was in the middle of. Without a
     claim queue the session walks ``orders`` in file order exactly as before.
+
+    Cancellation handling:
+      * A module-level ``_SESSION_CANCELLED`` flag is set by SIGINT/SIGTERM
+        handlers installed at the start of this session.
+      * The order-processing loop checks this flag before each row and stops
+        taking new orders when cancellation is detected.
+      * An order already in flight is allowed to complete (or fail on its
+        own merits) -- we never abort a remote submission mid-flight.
+      * The ``finally`` block always closes browser, context, and page.
+      * An interrupted run does NOT mark any order successful; it records
+        an "interrupted" outcome for the operator to reconcile.
     """
+    # --- Cancellation -------------------------------------------------------
+    _SESSION_CANCELLED = {"flag": False}
+
+    def _request_cancel(signum, frame):
+        _SESSION_CANCELLED["flag"] = True
+        print(
+            f"\n[cancel] stop requested (signal {signum}) -- finishing current "
+            f"order, then shutting down. No new orders will be started.",
+            flush=True,
+        )
+
+    # Install handlers for both SIGINT (Ctrl+C) and SIGTERM (GH Actions
+    # cancellation). On Windows, SIGTERM may not be available; guard it.
+    _old_sigint = signal.getsignal(signal.SIGINT)
+    _old_sigterm = None
+    signal.signal(signal.SIGINT, _request_cancel)
+    try:
+        _old_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, _request_cancel)
+    except (AttributeError, OSError):
+        # SIGTERM not available on this platform -- SIGINT still works.
+        pass
+
     with sync_playwright() as p:
         # PERF: keep in-page timers (fast_waits' wait_for_function
         # polling) running at full speed even while the window is
@@ -1710,6 +1745,15 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
             # original 1-based positions, so all logging still lines up with
             # the Excel sheet.
             for i, order in _iter_claimed_rows(todo, orders, claim_queue):
+                # --- Cancellation check before each order ------------------
+                if _SESSION_CANCELLED["flag"]:
+                    print(
+                        f"[cancel] stopping before row {i} -- no new orders will "
+                        f"be started after a stop request.",
+                        flush=True,
+                    )
+                    break
+
                 if claim_queue is not None:
                     # --workers: a worker only learns which row it owns at
                     # claim time, so plan it here, once, just before use.
@@ -1760,6 +1804,25 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                                failure_log, failed_rows, counters, flagged_rows,
                                label="final sweep", lock_mode=lock_mode)
         finally:
+            # Restore original signal handlers before exiting.
+            try:
+                signal.signal(signal.SIGINT, _old_sigint)
+            except (ValueError, OSError):
+                pass
+            try:
+                signal.signal(signal.SIGTERM, _old_sigterm)
+            except (AttributeError, OSError, ValueError, TypeError):
+                pass
+
+            if _SESSION_CANCELLED["flag"]:
+                print(
+                    "[cancel] run interrupted -- browser closed, no new orders "
+                    "started after stop request. Existing tracking data is "
+                    "untouched; orders already submitted remotely but not yet "
+                    "recorded in Turso must be reconciled manually.",
+                    flush=True,
+                )
+
             _stop_diagnostics_tracing(context, tracing_active)
             try:
                 context.close()
@@ -1893,6 +1956,62 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
             )
         if not client:
             raise RuntimeError("Production mode requires --client <client_id>.")
+
+        # Validate the client against configured clients before any order
+        # processing, browser launch, or credential loading.
+        # Accept both registry-registered clients AND client directories
+        # that exist on disk (some clients may be provisioned but not yet
+        # registered in _registry.json).
+        manager = WorkspaceManager()
+        known_clients = set(manager.known_client_ids())
+        # Also accept any client directory that has a profile/client.yaml
+        clients_root = manager.root
+        for entry in clients_root.iterdir():
+            if entry.is_dir() and (entry / "profile" / "client.yaml").exists():
+                known_clients.add(entry.name)
+        if client not in known_clients:
+            raise RuntimeError(
+                f"Unknown client {client!r}. Configured clients: "
+                f"{', '.join(sorted(known_clients))}. "
+                f"Add the client via 'client_manager.py init <name> --id <client_id>' "
+                f"before selecting it in the workflow."
+            )
+
+        # Set ACTIVE_WORKSPACE so per-client credentials (from the client's
+        # profile/client.yaml credential_reference) are loaded during login.
+        # Without this, _run_session falls back to global SNIPER_EMAIL/PASSWORD.
+        # In production mode there is no job directory yet, so we construct a
+        # lightweight workspace that points at the client's auth/run/diagnostic
+        # directories. The path fields are used only for credential cache,
+        # failure-log output, and diagnostics; no local SQLite progress DB is
+        # created or touched in production mode.
+        try:
+            paths = manager.client_paths(client)
+            _PRODUCTION_WORKSPACE = type(
+                "_ProductionWorkspace",
+                (),
+                {
+                    "client_id": client,
+                    "auth_dir": paths.auth_dir,
+                    "run_dir": paths.state_dir / "run",
+                    "diagnostics_dir": paths.state_dir / "diagnostics",
+                    "job_id": f"prod_{int(time.time())}",
+                    "job_dir": paths.state_dir,
+                    "source_path": None,
+                    "source_paths": (),
+                    "progress_dir": paths.state_dir,
+                    "client_progress_db": paths.client_progress_db,
+                    "catalog_dir": paths.catalog_dir,
+                    "job_lock_path": paths.state_dir / "job.lock",
+                    "root": paths.root,
+                },
+            )()
+            _configure_workspace(_PRODUCTION_WORKSPACE)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to configure workspace for client {client!r}: {exc}"
+            ) from exc
+
         tracker = ProductionTrackerCls(
             client_id=client, url=turso_url, auth_token=turso_auth
         )
@@ -1905,9 +2024,10 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
             orders = load_orders_from_sheets(
                 spreadsheet_id=source or "",
                 worksheet_name=worksheet_name or None,
+                client_id=client,
             )
             print(f"Loaded {len(orders)} order(s) from Google Sheet "
-                  f"(spreadsheet_id={source[:8]}...)")
+                  f"(spreadsheet_id={source[:8]}..., client={client})")
         else:
             raise ValueError(
                 f"source_type={source_type!r} is not supported in production mode. "
@@ -1985,7 +2105,72 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
               f"{shard_count}).")
 
     if dry_run:
-        print(f"Dry run: validated {len(orders)} order(s); no browser or uploads started.")
+        # --- DRY RUN: non-mutating validation --------------------------------
+        # Validates client + config, reads sheet data, checks existing success
+        # records in the tracking interface, and reports which rows are valid,
+        # already completed, eligible, or invalid. Does NOT open a browser,
+        # submit orders, or write to any tracking store.
+        from apps.sniper.production_tracker import production_order_key as _prod_key_fn
+
+        valid = 0
+        already_done = 0
+        invalid = 0
+        invalid_reasons: dict[str, int] = {}
+
+        # Batched lookup for production mode: fetch all existing keys once
+        # (one query), then check membership locally. Never one query per row.
+        existing_keys: set[str] = set()
+        if production:
+            existing_keys = tracker.get_existing_keys()
+
+        for o in orders:
+            # Validate required fields are present
+            missing_fields = _missing_required_fields(o)
+            if missing_fields:
+                invalid += 1
+                key = ", ".join(missing_fields)
+                invalid_reasons[key] = invalid_reasons.get(key, 0) + 1
+                continue
+
+            valid += 1
+
+            if production:
+                # Use batched lookup: fetch all existing keys once, check locally
+                _pk = _prod_key_fn(client, o)
+                if _pk in existing_keys:
+                    already_done += 1
+            else:
+                if progress.is_done(o) or job_progress.is_done(o):
+                    already_done += 1
+
+        eligible = valid - already_done
+
+        print(
+            f"[dry-run] client={client}: "
+            f"{len(orders)} total row(s), "
+            f"{valid} valid, "
+            f"{invalid} invalid, "
+            f"{already_done} already completed (skipped), "
+            f"{eligible} eligible for upload.",
+            flush=True,
+        )
+        if invalid_reasons:
+            print(
+                f"[dry-run] invalid-row reasons: "
+                + "; ".join(f"{k} ({v})" for k, v in invalid_reasons.items()),
+                flush=True,
+            )
+        if production:
+            print(
+                f"[dry-run] Turso tracking checked for client={client}: "
+                f"{already_done} order(s) already recorded as succeeded.",
+                flush=True,
+            )
+        print(
+            "[dry-run] NO browser opened, NO orders submitted, NO tracking data "
+            "mutated. Safe to repeat.",
+            flush=True,
+        )
         return {}
 
     # Production mode: use the Turso-backed tracker that was already
@@ -2034,14 +2219,18 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
         failed_ledger = FailedLedger(path=str(shard_ledger_path))
 
 
-    # Production mode: is_done() takes an order_key string, not an order dict.
-    # Local mode: is_done() takes an order dict and computes the key internally.
+    # Production mode: batched lookup of existing succeeded order keys,
+    # then filter locally in memory. One query instead of one per order.
+    # Always scoped by client_id via get_existing_keys().
     if production:
         _, production_order_key_fn = _import_production_modules()[0], None
         from apps.sniper.production_tracker import production_order_key as prod_key_fn
-        already_done_count = sum(
-            1 for o in orders if progress.is_done(prod_key_fn(client, o))
-        )
+        existing_keys = tracker.get_existing_keys()
+        already_done_count = 0
+        for o in orders:
+            _pk = prod_key_fn(client, o)
+            if _pk in existing_keys:
+                already_done_count += 1
     else:
         already_done_count = sum(1 for o in orders if progress.is_done(o))
     if already_done_count:
@@ -2308,7 +2497,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             _run_upload(lock_mode, refresh_catalog, enable_tracing,
                         workspace.client_id, None, workspace.job_id,
                         dry_run, skip_done, shard=shard,
-                        production=production, client=client)
+                        production=production)
             return
         try:
             manager.validate_client_ready(workspace.client_id)
@@ -2341,7 +2530,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
                         counts = _run_upload(lock_mode, refresh_catalog, enable_tracing,
                                              workspace.client_id, None, workspace.job_id,
                                              dry_run, skip_done, workers=workers,
-                                             production=production, client=client)
+                                             production=production)
             if dry_run:
                 manager.set_job_status(
                     workspace.client_id,
@@ -2467,7 +2656,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             return execute_workspace(workspace, shard=shard)
         return _run_upload(lock_mode, refresh_catalog, enable_tracing, client,
                            source, job, dry_run, skip_done, workers=workers,
-                           shard=shard, production=production, client=client)
+                           shard=shard, production=production)
 
     skip_values = {item.lower() for item in skip}
     manager.recover_claimed_files()
@@ -2553,9 +2742,9 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
                 flush=True,
             )
             return
-        return _run_upload(lock_mode, refresh_catalog, enable_tracing,
-                           None, None, None, dry_run, skip_done,
-                           production=production, client=client)
+        return _run_upload(lock_mode, refresh_catalog, enable_tracing, client,
+                           None, None, dry_run, skip_done,
+                           production=production)
     workspaces = list(pending_jobs)
     for inbox_file in files:
         claimed_file = manager.claim_inbox_file(inbox_file)

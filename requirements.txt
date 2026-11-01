@@ -2,7 +2,7 @@ playwright==1.45.0       # Controls Chrome browser to automate WhatsApp Web
 pandas==2.2.2            # Reads and processes the Excel customer file
 openpyxl==3.1.4          # Pandas engine for reading .xlsx files
 python-dotenv==1.0.1     # Loads .env files for secrets management
-libsql==0.5.0            # Turso remote SQLite client (production mode)
+libsql>=0.1.11           # Turso remote SQLite client (production mode)
 gspread==6.1.1           # Google Sheets API client (production mode)
 google-auth==2.29.0      # Google service account authentication (production mode)
 

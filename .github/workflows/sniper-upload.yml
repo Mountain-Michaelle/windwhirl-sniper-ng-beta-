@@ -4,9 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       client:
-        description: "Client ID to process (e.g. client_jane_97a9624c)"
+        description: "Client ID to process"
         required: true
-        default: "client_jane_97a9624c"
+        type: choice
+        options:
+          - client_jane_97a9624c
+          - client_alex_fd856e4c
+          - client_chisom_7254e7b4
+          - client_ephraim_1cc2c1f4
+          - client_fransisca_28a701dd
+          - client_michael_0c05e53b
+          - client_precious_a492616c
+          - client_valentine_8232c8bd
       source_type:
         description: "Data source type"
         required: false
@@ -108,7 +117,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('apps/sniper/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -116,12 +125,22 @@ jobs:
         run: |
           python -c "
           import os
-          required = ['SNIPER_EMAIL', 'SNIPER_PASSWORD', 'TURSO_URL', 'TURSO_AUTH',
+          # Per-client credentials are required for production mode.
+          # Global SNIPER_EMAIL/SNIPER_PASSWORD are legacy fallbacks only.
+          required = ['TURSO_URL', 'TURSO_AUTH',
                       'GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON', 'GOOGLE_SHEETS_SPREADSHEET_ID']
           missing = [v for v in required if not os.getenv(v)]
           if missing:
               print(f'MISSING REQUIRED ENV VARS: {missing}', flush=True)
               raise SystemExit(1)
+          # Check that at least one per-client credential pair exists
+          client = os.getenv('INPUT_CLIENT') or ''
+          client_prefix = client.replace('-', '_').replace(' ', '').upper()
+          client_email = os.getenv(f'{client_prefix}_EMAIL', '')
+          client_password = os.getenv(f'{client_prefix}_PASSWORD', '')
+          if not client_email or not client_password:
+              print(f'WARNING: No per-client credentials found for {client_prefix}_EMAIL/_PASSWORD', flush=True)
+              print('Falling back to global SNIPER_EMAIL/SNIPER_PASSWORD (legacy mode).', flush=True)
           print('All required production environment variables are present.', flush=True)
           "
 

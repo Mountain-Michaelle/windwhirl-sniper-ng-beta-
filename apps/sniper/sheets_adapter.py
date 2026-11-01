@@ -82,6 +82,7 @@ def _load_service_account_credentials() -> Credentials:
 def load_orders_from_sheets(
     spreadsheet_id: str,
     worksheet_name: Optional[str] = None,
+    client_id: Optional[str] = None,
 ) -> list[dict]:
     """
     Load orders from a Google Sheet and return them in the same normalized
@@ -92,6 +93,12 @@ def load_orders_from_sheets(
             the Sheet URL, e.g. the part after /d/ and before /edit).
         worksheet_name: Optional tab/worksheet name. Defaults to the first
             sheet (sheet1).
+        client_id: If provided, only rows whose client-identification column
+            matches this client_id are returned. The client column is detected
+            by looking for a header named "Client" or "Client ID". If the
+            sheet has no such column, all rows are returned and a warning is
+            printed — the caller must not assume client-specific filtering is
+            happening just because client_id was supplied.
 
     Returns:
         list[dict] with keys matching COLUMN_MAP internal names:
@@ -131,11 +138,38 @@ def load_orders_from_sheets(
             f"expected column(s): {missing}. Found columns: {headers}"
         )
 
+    # Detect client-identification column (if any)
+    client_col_name: Optional[str] = None
+    for candidate in ("Client", "Client ID", "client_id", "client"):
+        if candidate in header_indices:
+            client_col_name = candidate
+            break
+
+    if client_id is not None and client_col_name is None:
+        print(
+            f"[sheets] WARNING: sheet '{sh.title}' / '{ws.title}' has no "
+            f"client-identification column ('Client', 'Client ID', "
+            f"'client_id', or 'client'). All rows will be returned; "
+            f"client_id={client_id!r} filtering cannot be applied at the "
+            f"sheet level. Confirm this sheet is client-specific or add a "
+            f"client column before relying on client-scoped filtering.",
+            flush=True,
+        )
+
     orders: list[dict] = []
+    skipped_non_client = 0
     for pos, row in enumerate(all_values[1:], start=2):  # excel_row = pos
         # Skip fully blank rows
         if all(_is_blank(cell) for cell in row):
             continue
+
+        # Client-level filtering: skip rows belonging to a different client
+        if client_id is not None and client_col_name is not None:
+            col_idx = header_indices[client_col_name]
+            row_client = row[col_idx].strip() if col_idx < len(row) else ""
+            if row_client != client_id:
+                skipped_non_client += 1
+                continue
 
         order: dict = {}
         for excel_col, internal in COLUMN_MAP.items():
@@ -150,5 +184,11 @@ def load_orders_from_sheets(
 
         order["excel_row"] = pos
         orders.append(order)
+
+    if skipped_non_client:
+        print(
+            f"[sheets] client_id={client_id!r}: skipped {skipped_non_client} "
+            f"row(s) belonging to other clients.", flush=True,
+        )
 
     return orders
