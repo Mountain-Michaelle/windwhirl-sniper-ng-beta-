@@ -47,6 +47,18 @@ reason, the run proceeds exactly as before, just without saved traces.
 
 from __future__ import annotations
 
+# ==============================================================
+# PATH SETUP — MUST BE FIRST
+# ==============================================================
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+# ==============================================================
+
+
 import argparse
 import dataclasses
 import json
@@ -54,12 +66,12 @@ import os
 import signal
 import subprocess
 import statistics
-import sys
 import time
 
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
+
+from apps.sniper.production_tracker import ProductionFailedLedger, ProductionRetryCache
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:

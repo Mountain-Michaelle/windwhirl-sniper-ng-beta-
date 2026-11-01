@@ -1,0 +1,8 @@
+client_id: client_chisom_5fa0f757
+name_key: chisom
+display_name: chisom
+created_at: "2026-11-01T04:00:00Z"
+enabled: true
+credential_reference: env:CHISOM_5FA0F757
+# Configure crm_account_id before uploading.
+crm_account_id: client_chisom_5fa0f757
