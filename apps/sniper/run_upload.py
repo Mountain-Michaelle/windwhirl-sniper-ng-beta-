@@ -2643,15 +2643,16 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
                 for workspace in client_jobs:
                     execute_workspace(workspace)
                 return
-            input_path = Path(source).resolve()
-            inbox_copy = manager.root / "_inbox" / (
-                f".{client}_{os.getpid()}_{time.time_ns()}{input_path.suffix.lower()}"
-            )
-            import shutil
-            shutil.copy2(input_path, inbox_copy)
-            workspace = manager.import_inbox(inbox_copy, client_id=client)
-            job = workspace.job_id
-            source = None
+            if source_type != "sheets":
+                input_path = Path(source).resolve()
+                inbox_copy = manager.root / "_inbox" / (
+                    f".{client}_{os.getpid()}_{time.time_ns()}{input_path.suffix.lower()}"
+                )
+                import shutil
+                shutil.copy2(input_path, inbox_copy)
+                workspace = manager.import_inbox(inbox_copy, client_id=client)
+                job = workspace.job_id
+                source = None
         if client and job:
             # FIX (Sep 2026, "log completed jobs and stop without opening the
             # browser if it is truly completed"): an explicit --client/--job
