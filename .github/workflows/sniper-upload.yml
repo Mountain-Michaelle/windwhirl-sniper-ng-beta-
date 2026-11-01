@@ -1,3 +1,6 @@
+# ============================================================
+# FILE: .github/workflows/sniper-upload-production.yml
+# ============================================================
 name: Sniper Upload Production
 
 on:
@@ -57,6 +60,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 240
 
+    # FIX: windows-latest defaults to PowerShell, which does not understand "\".
+    # Git Bash is preinstalled on Windows runners, so every run step uses it.
+    defaults:
+      run:
+        shell: bash
+
     env:
       # Client credentials - from GitHub Secrets (never committed)
       SNIPER_EMAIL: ${{ secrets.SNIPER_EMAIL }}
@@ -94,14 +103,27 @@ jobs:
       WW_MAX_RETRY_ATTEMPTS: "5"
 
     steps:
-      - name: Cancel any previous run for this client
-        if: github.event_name == 'workflow_dispatch'
-        uses: styfle/cancel-workflow-action@0.12.0
-        with:
-          access_token: ${{ github.token }}
+      # DISABLED: with only a token this cancels ALL other in-progress runs of this
+      # workflow (other clients too), which contradicts the per-client "concurrency"
+      # block above. Uncomment only if you really want that.
+      # - name: Cancel any previous run for this client
+      #   if: github.event_name == 'workflow_dispatch'
+      #   uses: styfle/cancel-workflow-action@0.12.0
+      #   with:
+      #     access_token: ${{ github.token }}
 
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}   # branch tip, not the SHA the run started on
+
+      - name: Show commit being run
+        run: |
+          echo "Branch            : ${{ github.ref_name }}"
+          echo "Run started on SHA: ${{ github.sha }}"
+          echo "Checked out HEAD  : $(git rev-parse HEAD)"
+          echo "Run attempt       : ${{ github.run_attempt }}"
+          git log -1 --format='Latest commit    : %h | %an | %ad | %s'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -114,7 +136,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Cache pip packages
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
@@ -122,6 +144,8 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Validate configuration
+        env:
+          INPUT_CLIENT: ${{ inputs.client }}
         run: |
           python -c "
           import os
@@ -136,6 +160,8 @@ jobs:
           # Check that at least one per-client credential pair exists
           client = os.getenv('INPUT_CLIENT') or ''
           client_prefix = client.replace('-', '_').replace(' ', '').upper()
+          if client_prefix.startswith('CLIENT_'):
+              client_prefix = client_prefix[len('CLIENT_'):]
           client_email = os.getenv(f'{client_prefix}_EMAIL', '')
           client_password = os.getenv(f'{client_prefix}_PASSWORD', '')
           if not client_email or not client_password:
@@ -165,7 +191,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: upload-logs-${{ github.run_number }}
+          name: upload-logs-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             apps/sniper/logs/
             apps/sniper/reports/
