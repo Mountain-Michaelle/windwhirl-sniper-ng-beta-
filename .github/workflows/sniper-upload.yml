@@ -174,13 +174,13 @@ jobs:
         if: inputs.dry_run == 'true'
         run: |
           cd apps/sniper
-          python run_upload.py --production --source-type sheets --client ${{ inputs.client }} --source ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }} --dry-run --max-parallel ${{ inputs.max_parallel }} --lock
+          python run_upload.py --production --source-type sheets --client ${{ inputs.client }} --source 1gAmd9Ar8I_6ATCCtWFJ2FVr8zcjsKis_7aC7DgKkevs --dry-run --max-parallel ${{ inputs.max_parallel }} --lock
 
       - name: Real production upload (requires explicit confirmation)
         if: inputs.dry_run == 'false'
         run: |
           cd apps/sniper
-          python run_upload.py --production --source-type sheets --client ${{ inputs.client }} --source ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }} --max-parallel ${{ inputs.max_parallel }} --lock
+          python run_upload.py --production --source-type sheets --client ${{ inputs.client }} --source 1gAmd9Ar8I_6ATCCtWFJ2FVr8zcjsKis_7aC7DgKkevs --dry-run --max-parallel ${{ inputs.max_parallel }} --lock
 
       - name: Upload logs on failure
         if: failure()
