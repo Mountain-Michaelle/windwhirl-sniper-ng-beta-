@@ -92,7 +92,7 @@ class ProductionTracker:
     def _connect(self):
         """Establish the Turso connection. Raises on failure -- never falls back."""
         try:
-            self._conn = libsql.connect(url=self.url, auth_token=self.auth_token)
+            self._conn = libsql.connect(database=self.url, auth_token=self.auth_token)
         except Exception as exc:
             raise RuntimeError(f"Turso connection failed: {exc}") from exc
 
