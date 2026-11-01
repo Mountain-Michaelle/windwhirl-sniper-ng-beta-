@@ -206,7 +206,7 @@ def _import_production_modules():
     if _SHEETS_ADAPTER is None:
         from apps.sniper.sheets_adapter import load_orders_from_sheets
         _SHEETS_ADAPTER = load_orders_from_sheets
-    return _PRODUCTION_TRACKER, _SHEETS_ADAPTER
+    return *_PRODUCTION_TRACKER, _SHEETS_ADAPTER
 
 # ==============================================================================
 LOGIN_URL = "https://sniper.ng/login"
@@ -2235,7 +2235,7 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
     # then filter locally in memory. One query instead of one per order.
     # Always scoped by client_id via get_existing_keys().
     if production:
-        _, production_order_key_fn = _import_production_modules()[0], None
+        _, production_order_key_fn = _import_production_modules()[:2]
         from apps.sniper.production_tracker import production_order_key as prod_key_fn
         existing_keys = tracker.get_existing_keys()
         already_done_count = 0
