@@ -159,11 +159,7 @@ jobs:
         if: inputs.dry_run == 'false'
         run: |
           cd apps/sniper
-          python run_upload.py --production --source-type sheets \
-            --client ${{ inputs.client }} \
-            --source ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }} \
-            --max-parallel ${{ inputs.max_parallel }} \
-            --target-product ${{ inputs.target_product }}
+          python run_upload.py --production --source-type sheets --client ${{ inputs.client }} --source ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }} --max-parallel ${{ inputs.max_parallel }} --target-product ${{ inputs.target_product }}
 
       - name: Upload logs on failure
         if: failure()
