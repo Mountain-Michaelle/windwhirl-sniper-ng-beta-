@@ -1009,7 +1009,7 @@ def _attempt_order(page, cfg, order: dict, row_number, progress: ProgressTracker
                   f"(same customer+phone+product+price fingerprint) -- not resubmitting", flush=True)
             return True
     else:
-        if progress.is_done(order) or job_progress.is_done(order):
+        if progress.is_done(order) or (job_progress is not None and job_progress.is_done(order)):
             counters["skipped_duplicate"] = counters.get("skipped_duplicate", 0) + 1
             retry_cache.remove(order)
             failed_ledger.remove(order)
@@ -1238,7 +1238,7 @@ def _drain_failed_ledger(page, cfg, orders, progress, job_progress, retry_cache,
             if fresh_row is not None:
                 row_number = fresh_row
 
-        if progress.is_done(order) or job_progress.is_done(order):
+        if progress.is_done(order) or (job_progress is not None and job_progress.is_done(order)):
             failed_ledger.remove_key(entry.key)
             continue
         # A changed row must be attempted even if the last reason looked
@@ -2157,7 +2157,7 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
                 if _pk in existing_keys:
                     already_done += 1
             else:
-                if progress.is_done(o) or job_progress.is_done(o):
+                if progress.is_done(o) or (job_progress is not None and job_progress.is_done(o)):
                     already_done += 1
 
         eligible = valid - already_done
