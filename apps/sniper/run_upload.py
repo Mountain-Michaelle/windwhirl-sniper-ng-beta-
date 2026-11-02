@@ -2509,7 +2509,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             _run_upload(lock_mode, refresh_catalog, enable_tracing,
                         workspace.client_id, None, workspace.job_id,
                         dry_run, skip_done, shard=shard,
-                        production=production)
+                        production=production, source_type=source_type)
             return
         try:
             manager.validate_client_ready(workspace.client_id)
@@ -2542,7 +2542,7 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
                         counts = _run_upload(lock_mode, refresh_catalog, enable_tracing,
                                              workspace.client_id, None, workspace.job_id,
                                              dry_run, skip_done, workers=workers,
-                                             production=production)
+                                             production=production, source_type=source_type)
             if dry_run:
                 manager.set_job_status(
                     workspace.client_id,
@@ -2669,7 +2669,8 @@ def main(lock_mode: bool = False, refresh_catalog: bool = False,
             return execute_workspace(workspace, shard=shard)
         return _run_upload(lock_mode, refresh_catalog, enable_tracing, client,
                            source, job, dry_run, skip_done, workers=workers,
-                           shard=shard, production=production)
+                           shard=shard, production=production,
+                           source_type=source_type)
 
     skip_values = {item.lower() for item in skip}
     manager.recover_claimed_files()
