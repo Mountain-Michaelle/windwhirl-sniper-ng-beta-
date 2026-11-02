@@ -2191,6 +2191,7 @@ def _run_upload(lock_mode: bool = False, refresh_catalog: bool = False,
         progress = tracker
         retry_cache = retry_cache
         failed_ledger = failed_ledger
+        job_progress = None  # production uses Turso, no local job_progress DB
     else:
         progress_path = (
             ACTIVE_WORKSPACE.client_progress_db
