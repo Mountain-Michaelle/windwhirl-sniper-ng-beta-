@@ -29,7 +29,7 @@ on:
       dry_run:
         description: "Dry run mode (validate only, no uploads)"
         required: false
-        default: "true"
+        default: "false"
         type: choice
         options:
           - "true"
