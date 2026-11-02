@@ -1498,9 +1498,11 @@ def _plan_row(order: dict, row_number: int, catalog: list[str],
     where = f", Filtered # {sn}" if sn else ""
     label = (plan.state if plan.state is not None
              else "no state inferable -- state field will be skipped")
+    def _safe(s):
+        return str(s).encode("ascii", errors="replace").decode("ascii")
     print(f"[address] row {row_number}{where} "
-          f"({order.get('customer_name')!r}): "
-          f"{str(order.get('address', ''))[:60]!r} -> {label}",
+          f"({_safe(order.get('customer_name'))}): "
+          f"{_safe(order.get('address', ''))[:60]} -> {label}",
           flush=True)
     return plan, None, False
 
