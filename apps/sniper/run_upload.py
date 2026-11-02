@@ -1687,7 +1687,10 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
             todo: list[tuple[int, dict]] = [
                 (row_number, order)
                 for row_number, order in enumerate(orders, start=1)
-                if not (progress.is_done(order) or job_progress.is_done(order))
+                if not (
+                    progress.is_done(order)
+                    or (job_progress is not None and job_progress.is_done(order))
+                )
             ]
             skipped_done = len(orders) - len(todo)
             if skipped_done:

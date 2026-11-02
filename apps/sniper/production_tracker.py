@@ -180,8 +180,9 @@ class ProductionTracker:
     # ------------------------------------------------------------------
     # Per-order operations
     # ------------------------------------------------------------------
-    def is_done(self, order_key: str) -> bool:
-        """Check whether this client+order_key already succeeded."""
+    def is_done(self, order: dict) -> bool:
+        """Check whether this client+order already succeeded."""
+        order_key = production_order_key(self.client_id, order)
         row = self._conn.execute(
             "SELECT 1 FROM succeeded_orders WHERE client_id = ? AND order_key = ?",
             (self.client_id, order_key)
