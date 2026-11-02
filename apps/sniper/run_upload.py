@@ -1804,7 +1804,7 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                 succeeded = _attempt_order(
                     page, cfg, order, i, progress, job_progress, retry_cache, failed_ledger,
                     failure_log, failed_rows, counters, flagged_rows, plan=plans[i],
-                    lock_mode=lock_mode
+                    lock_mode=lock_mode, production=production, client=client,
                 )
 
                 if succeeded:
