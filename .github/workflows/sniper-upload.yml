@@ -38,15 +38,6 @@ on:
         description: "Max concurrent browser sessions"
         required: false
         default: "1"
-      target_product:
-        description: "Product filter keyword"
-        required: false
-        default: "sadoer"
-      daily_limit:
-        description: "Max messages per day"
-        required: false
-        default: "50"
-
 permissions:
   contents: read
   id-token: write
@@ -98,8 +89,6 @@ jobs:
       GOOGLE_SHEETS_WORKSHEET_NAME: ${{ vars.GOOGLE_SHEETS_WORKSHEET_NAME }}
 
       # Runtime configuration
-      DAILY_LIMIT: ${{ inputs.daily_limit }}
-      TARGET_PRODUCT: ${{ inputs.target_product }}
       WW_MAX_RETRY_ATTEMPTS: "5"
 
     steps:
