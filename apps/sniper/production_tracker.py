@@ -162,6 +162,10 @@ class ProductionTracker:
         )
         self._conn.commit()
 
+        count = len(self.get_existing_keys())
+        print(f"[progress] connected to Turso ({self.url}) -- {count} previously-succeeded "
+              f"order(s) on record (client={self.client_id}).", flush=True)
+
     # ------------------------------------------------------------------
     # Batch read -- called once per run, not per order
     # ------------------------------------------------------------------

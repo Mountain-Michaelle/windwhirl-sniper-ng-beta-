@@ -71,7 +71,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from apps.sniper.production_tracker import ProductionFailedLedger, ProductionRetryCache
+from apps.sniper.production_tracker import ProductionFailedLedger, ProductionRetryCache, production_order_key
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -1690,7 +1690,11 @@ def _run_session(lock_mode: bool, orders: list[dict], progress: ProgressTracker,
                 (row_number, order)
                 for row_number, order in enumerate(orders, start=1)
                 if not (
-                    progress.is_done(order)
+                    progress.is_done(
+                        production_order_key(client, order)
+                        if production and client
+                        else order
+                    )
                     or (job_progress is not None and job_progress.is_done(order))
                 )
             ]
